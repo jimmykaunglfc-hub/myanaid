@@ -6,4 +6,5 @@ node_modules/
 .next/
 dist/
 build/
+out/
 .DS_Store

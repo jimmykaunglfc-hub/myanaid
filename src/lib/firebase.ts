@@ -4,7 +4,9 @@
  */
 import { getApp, getApps, initializeApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
-import { getFirestore } from "firebase/firestore";
+import { getFunctions } from "firebase/functions";
+import { initializeFirestore } from "firebase/firestore";
+import { getStorage } from "firebase/storage";
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -19,5 +21,14 @@ const isConfigured = Boolean(firebaseConfig.apiKey && firebaseConfig.projectId);
 const app = isConfigured ? (getApps().length ? getApp() : initializeApp(firebaseConfig)) : null;
 
 export const auth = app ? getAuth(app) : null;
-export const db = app ? getFirestore(app) : null;
+// The browser running the local preview keeps Firestore's default streaming
+// channel open indefinitely. Long polling is more reliable in that environment.
+export const db = app ? initializeFirestore(app, {
+  experimentalForceLongPolling: true,
+  experimentalLongPollingOptions: { timeoutSeconds: 25 },
+}) : null;
+// Callable functions remain server-side; this only provides the authenticated
+// client connection to the asia-southeast1 MyanAid Functions region.
+export const functions = app ? getFunctions(app, "asia-southeast1") : null;
+export const storage = app ? getStorage(app) : null;
 export { isConfigured };

@@ -37,3 +37,31 @@ The first version will include:
 - MyanAid does not issue evacuation orders.
 - Modelled or satellite data must be clearly labelled.
 - Missing data means unknown conditions, not safe conditions.
+
+## Public monitoring ingestion
+
+The browser can show a temporary public-feed fallback during local development.
+For production, `functions/index.js` runs every 15 minutes and stores only
+provider facts and provenance in these Firestore documents:
+
+- `sourceEvents/weather-bangkok` — Open-Meteo modelled weather conditions
+- `sourceEvents/earthquake-latest` — latest USGS M4.5+ event
+- `sourceEvents/earthquake-{id}` — an archival record for the observed USGS event
+
+Browsers can read `sourceEvents`, but cannot write to them. The server-side
+Firebase Function is the only writer through the Admin SDK.
+
+### Deploying the monitoring worker
+
+Cloud Functions and scheduled jobs require the Firebase **Blaze** plan. After
+upgrading the Firebase project and signing into the CLI, deploy the rules,
+Function, and website from the project root:
+
+```bash
+npx firebase-tools login
+npx firebase-tools deploy --only firestore:rules,functions,hosting
+```
+
+The Firebase CLI prints the Function deployment status. After its first
+scheduled run, open Firestore and look for the `sourceEvents` collection.
+The schedule may take up to 15 minutes to produce the first records.
