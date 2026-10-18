@@ -8,3 +8,6 @@ dist/
 build/
 out/
 .DS_Store
+messages/
+.mcp.json
+.codex/

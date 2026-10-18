@@ -38,6 +38,23 @@ The first version will include:
 - Modelled or satellite data must be clearly labelled.
 - Missing data means unknown conditions, not safe conditions.
 
+## H5 app-package downloads
+
+The H5 app detects Android and iOS browsers and offers the corresponding
+package from the entry dialog and Profile page. Configure the public URLs in
+the environment used to build the static site:
+
+```bash
+NEXT_PUBLIC_ANDROID_DOWNLOAD_URL=https://downloads.example.com/MyanAid.apk
+NEXT_PUBLIC_IOS_DOWNLOAD_URL=https://testflight.apple.com/join/your-code
+```
+
+Android may use a signed HTTPS APK or Play Store landing page. iOS must use a
+TestFlight, App Store, or signed HTTPS `itms-services` distribution manifest;
+Safari cannot install an arbitrary unsigned `.ipa` file. The prompt is not
+shown inside the installed Capacitor app, and no device information is sent or
+stored for detection.
+
 ## Public monitoring ingestion
 
 The browser can show a temporary public-feed fallback during local development.

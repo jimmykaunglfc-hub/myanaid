@@ -2,7 +2,10 @@
 
 import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
-import type { User } from "firebase/auth";
+import type { User as FirebaseWebUser } from "firebase/auth";
+import { Capacitor } from "@capacitor/core";
+import { FirebaseAuthentication } from "@capacitor-firebase/authentication";
+import { FirebaseFirestore } from "@capacitor-firebase/firestore";
 import {
   createUserWithEmailAndPassword,
   onAuthStateChanged,
@@ -13,6 +16,16 @@ import { httpsCallable } from "firebase/functions";
 import { collection, doc, getDoc, onSnapshot, serverTimestamp, setDoc } from "firebase/firestore";
 import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import { auth, db, functions, isConfigured, storage } from "@/lib/firebase";
+import { listenForDeviceUrl, saveDeviceOutlook, syncDeviceAlertPreferences } from "@/lib/device-alerts";
+import { detectAppDownloadPlatform, downloadAppPackage, hasAppPackage, type AppDownloadPlatform, type DownloadableAppPlatform } from "@/lib/app-download";
+import { AppLocaleProvider, appLanguages, type AppLocale, PublicTranslation, useAppI18n } from "@/i18n/client";
+
+// Native Firebase Auth has its own secure iOS session. Keep only the shared
+// fields the UI needs, so browser Firebase Auth remains unchanged on the web.
+type AppUser = Pick<FirebaseWebUser, "uid" | "email">;
+const usesNativeFirebase = Capacitor.isNativePlatform();
+const nativeProfileReference = (uid: string) => `users/${uid}`;
+const profileTimestamp = () => usesNativeFirebase ? new Date().toISOString() : serverTimestamp();
 
 // Temporary visual QA window requested for the SOS interaction. It expires
 // automatically at 13:14 Bangkok time on October 17, 2026.
@@ -261,7 +274,61 @@ type GoogleMapsPosition = { lat: number; lng: number };
 type GdacsImpact = { alertScore?: number; severityValue?: number; severityUnit?: string; severityText?: string; endAt?: string; affectedCountries?: string[]; overviewMapUrl?: string; rainfallMapUrl?: string };
 type SourceFeedItem = { id: string; title: string; category: string; severity: string; location: string; occurredAt: string; updatedAt: string; url: string; source: string; summary?: string; coordinates?: SourceCoordinates; areaGeometry?: string; gdacs?: GdacsImpact };
 type SourceFeed = { id: string; provider: string; kind: string; fetchedAt: string; safetyNotice: string; events: SourceFeedItem[] };
-type SourceMonitoringState = { airQuality: { pm25: number; pm10: number; usAqi: number; observedAt: string } | null; river: { date: string; discharge: number } | null; feeds: SourceFeed[] };
+type WeatherOutlook = { score: number; level: "routine" | "watch" | "elevated"; confidence: "low" | "limited" | "moderate"; window: string; peakDate: string; factors: string[]; suggestions: string[]; forecast: { maxProbability: number; maxRainMm: number; maxWindGustKph: number }; historical: { completedDays: number; wetDays: number; meanDailyRainMm: number | null; forecastRainPercentile: number | null }; nearbyEventCount: number; fetchedAt: string; safetyNotice: string };
+type SourceMonitoringState = { airQuality: { pm25: number; pm10: number; usAqi: number; observedAt: string } | null; river: { date: string; discharge: number } | null; outlook: WeatherOutlook | null; feeds: SourceFeed[] };
+
+type AdvanceOutlookReminder = { version: 1; generatedAt: string; location: string; level: WeatherOutlook["level"]; score: number; companionId: MascotId; companionName: string; currentCondition: string; forecastSummary: string; forecastRainChance: number; forecastRainMm: number; forecastWindKph: number; recommendedActions: string[]; text: string; safetyNotice: string };
+
+function advanceOutlookReminder(outlook: WeatherOutlook, weather: LiveWeather | null = null, mascotId: MascotId = "maya"): AdvanceOutlookReminder {
+  const level = outlook.level === "elevated" ? "Elevated weather attention" : outlook.level === "watch" ? "Weather watch" : "Routine weather outlook";
+  const factors = outlook.factors.slice(0, 2).join(". ");
+  const preparation = outlook.suggestions[0] ?? "Check official local weather guidance before travelling.";
+  const companion = findMascot(mascotId);
+  const currentCondition = weather ? `${weather.description ?? weatherLabel(weather.code)} · ${Math.round(weather.temperature)}°C · ${weather.rain} mm rain · ${Math.round(weather.wind)} km/h wind` : "Current conditions are updating in MyanAid.";
+  const forecastSummary = `Next 72 hours: up to ${outlook.forecast.maxProbability}% rain chance, ${outlook.forecast.maxRainMm} mm forecast rain, and ${Math.round(outlook.forecast.maxWindGustKph)} km/h peak gusts.`;
+  return {
+    version: 1,
+    generatedAt: outlook.fetchedAt,
+    location: "Bangkok, Thailand",
+    level: outlook.level,
+    score: outlook.score,
+    companionId: mascotId,
+    companionName: companion.name,
+    currentCondition,
+    forecastSummary,
+    forecastRainChance: outlook.forecast.maxProbability,
+    forecastRainMm: outlook.forecast.maxRainMm,
+    forecastWindKph: Math.round(outlook.forecast.maxWindGustKph),
+    recommendedActions: outlook.suggestions.slice(0, 2),
+    text: `${companion.name}'s ${level.toLowerCase()} for Bangkok over the next 72 hours. ${factors || `Peak rain chance is ${outlook.forecast.maxProbability}% with up to ${outlook.forecast.maxRainMm} millimetres forecast rain.`} ${preparation} ${outlook.safetyNotice}`,
+    safetyNotice: outlook.safetyNotice,
+  };
+}
+
+// The widget must remain useful if the server-side AI outlook has not reached
+// the device yet. This initial payload is replaced as soon as that outlook is
+// available; it never claims to be an official warning.
+function fallbackWidgetOutlook(weather: LiveWeather | null): WeatherOutlook {
+  const stormRisk = weather?.thunderstormProbability ?? 0;
+  const rain = weather?.rain ?? 0;
+  const wind = weather?.wind ?? 0;
+  const score = weather ? Math.min(100, Math.round(stormRisk * 0.65 + rain * 2.5 + wind * 0.45)) : 0;
+  const level: WeatherOutlook["level"] = score >= 45 ? "elevated" : score >= 20 ? "watch" : "routine";
+  return {
+    score,
+    level,
+    confidence: weather ? "limited" : "low",
+    window: "Next 72 hours",
+    peakDate: "Forecast updating",
+    factors: weather ? [`Current rain is ${rain} mm.`, `Wind is ${Math.round(wind)} km/h.`] : ["Current weather is updating."],
+    suggestions: weather ? [rain > 0 || stormRisk >= 35 ? "Carry rain protection and allow extra travel time." : "Check local conditions before travelling."] : ["Open MyanAid after connecting to refresh weather and AI guidance."],
+    forecast: { maxProbability: stormRisk, maxRainMm: rain, maxWindGustKph: wind },
+    historical: { completedDays: 0, wetDays: 0, meanDailyRainMm: null, forecastRainPercentile: null },
+    nearbyEventCount: 0,
+    fetchedAt: new Date().toLocaleString([], { dateStyle: "medium", timeStyle: "short" }),
+    safetyNotice: "This is a modelled summary, not an official warning. Follow local authorities.",
+  };
+}
 
 type GoogleMapInstance = { fitBounds: (bounds: GoogleMapBounds, padding?: number) => void; setMapTypeId: (mapType: string) => void; setTilt: (tilt: number) => void; setZoom: (zoom: number) => void };
 type GoogleMapBounds = { extend: (position: GoogleMapsPosition) => void; isEmpty: () => boolean };
@@ -272,7 +339,7 @@ type GooglePlaceResult = { place_id?: string; name?: string; vicinity?: string; 
 type NearbyPlace = { id: string; name: string; address: string; latitude: number; longitude: number };
 const EMPTY_SOURCE_POINTS: Array<SourceFeedItem & { coordinates: SourceCoordinates }> = [];
 const EMPTY_NEARBY_PLACES: NearbyPlace[] = [];
-type GoogleMapsRuntime = { maps: { Map: new (element: HTMLElement, options: { center: GoogleMapsPosition; zoom: number; mapTypeId?: string; mapId?: string; heading?: number; tilt?: number; mapTypeControl?: boolean; streetViewControl?: boolean; fullscreenControl?: boolean; gestureHandling?: string }) => GoogleMapInstance; Marker: new (options: { map: GoogleMapInstance; position: GoogleMapsPosition; title: string; icon?: string }) => GoogleMapMarker; Polygon: new (options: { map: GoogleMapInstance; paths: GoogleMapsPosition[][]; strokeColor: string; strokeOpacity: number; strokeWeight: number; fillColor: string; fillOpacity: number }) => unknown; InfoWindow: new (options: { content: Node }) => { open: (map: GoogleMapInstance, marker: GoogleMapMarker) => void; setContent: (content: Node) => void }; LatLngBounds: new () => GoogleMapBounds; Geocoder: new () => { geocode: (request: { address: string }, callback: (results: GoogleGeocoderResult[] | null, status: string) => void) => void }; places?: { PlacesService: new (map: GoogleMapInstance) => { textSearch: (request: { query: string; location: GoogleMapsPosition; radius: number }, callback: (results: GooglePlaceResult[] | null, status: string) => void) => void } }; StreetViewService: new () => { getPanorama: (request: { location: GoogleMapsPosition; radius: number }, callback: (result: { location?: { latLng?: GoogleMapsPosition } } | null, status: string) => void) => void }; StreetViewPanorama: new (element: HTMLElement, options: { position: GoogleMapsPosition; pov: { heading: number; pitch: number }; zoom: number; addressControl?: boolean; fullscreenControl?: boolean; motionTracking?: boolean }) => unknown } };
+type GoogleMapsRuntime = { maps: { Map: new (element: HTMLElement, options: { center: GoogleMapsPosition; zoom: number; mapTypeId?: string; mapId?: string; heading?: number; tilt?: number; mapTypeControl?: boolean; streetViewControl?: boolean; fullscreenControl?: boolean; gestureHandling?: string }) => GoogleMapInstance; Marker: new (options: { map: GoogleMapInstance; position: GoogleMapsPosition; title: string; icon?: string }) => GoogleMapMarker; Polygon: new (options: { map: GoogleMapInstance; paths: GoogleMapsPosition[][]; strokeColor: string; strokeOpacity: number; strokeWeight: number; fillColor: string; fillOpacity: number }) => unknown; InfoWindow: new (options: { content: Node }) => { open: (map: GoogleMapInstance, marker: GoogleMapMarker) => void; setContent: (content: Node) => void }; LatLngBounds: new () => GoogleMapBounds; Geocoder: new () => { geocode: (request: { address: string }, callback: (results: GoogleGeocoderResult[] | null, status: string) => void) => void }; places?: { PlacesService: new (map: GoogleMapInstance) => { textSearch: (request: { query: string; location: GoogleMapsPosition; radius: number }, callback: (results: GooglePlaceResult[] | null, status: string) => void) => void } }; StreetViewService: new () => { getPanorama: (request: { location: GoogleMapsPosition; radius: number }, callback: (result: { location?: { latLng?: GoogleMapsPosition } } | null, status: string) => void) => void }; StreetViewPanorama: new (element: HTMLElement, options: { position: GoogleMapsPosition; pov: { heading: number; pitch: number }; zoom: number; addressControl?: boolean; fullscreenControl?: boolean; motionTracking?: boolean; linksControl?: boolean; panControl?: boolean; enableCloseButton?: boolean }) => unknown } };
 
 declare global { interface Window { google?: GoogleMapsRuntime; myanAidMapsPromise?: Promise<GoogleMapsRuntime> } }
 
@@ -543,7 +610,7 @@ function useCurrentLocation() {
 }
 
 function useSourceMonitoring() {
-  const [sourceMonitoring, setSourceMonitoring] = useState<SourceMonitoringState>({ airQuality: null, river: null, feeds: [] });
+  const [sourceMonitoring, setSourceMonitoring] = useState<SourceMonitoringState>({ airQuality: null, river: null, outlook: null, feeds: [] });
   useEffect(() => {
     if (!db) return;
     const firestore = db;
@@ -612,9 +679,27 @@ function useSourceMonitoring() {
         setSourceMonitoring(previous => ({ ...previous, river }));
       }
     });
+    const stopOutlook = onSnapshot(doc(firestore, "sourceEvents", "weather-analysis-bangkok"), (snapshot) => {
+      const event = snapshot.data();
+      const data = event?.data as Partial<WeatherOutlook> | undefined;
+      if (!data || typeof data.score !== "number" || !["routine", "watch", "elevated"].includes(String(data.level))) return;
+      const forecast = data.forecast;
+      const historical = data.historical;
+      if (!forecast || !historical || typeof forecast.maxProbability !== "number" || typeof forecast.maxRainMm !== "number" || typeof forecast.maxWindGustKph !== "number") return;
+      const outlook: WeatherOutlook = {
+        score: data.score, level: data.level as WeatherOutlook["level"], confidence: data.confidence === "moderate" || data.confidence === "limited" ? data.confidence : "low",
+        window: typeof data.window === "string" ? data.window : "Next 72 hours", peakDate: typeof data.peakDate === "string" ? data.peakDate : "Forecast period",
+        factors: Array.isArray(data.factors) ? data.factors.filter((factor): factor is string => typeof factor === "string").slice(0, 4) : [],
+        suggestions: Array.isArray(data.suggestions) ? data.suggestions.filter((suggestion): suggestion is string => typeof suggestion === "string").slice(0, 3) : [],
+        forecast: { maxProbability: forecast.maxProbability, maxRainMm: forecast.maxRainMm, maxWindGustKph: forecast.maxWindGustKph },
+        historical: { completedDays: typeof historical.completedDays === "number" ? historical.completedDays : 0, wetDays: typeof historical.wetDays === "number" ? historical.wetDays : 0, meanDailyRainMm: typeof historical.meanDailyRainMm === "number" ? historical.meanDailyRainMm : null, forecastRainPercentile: typeof historical.forecastRainPercentile === "number" ? historical.forecastRainPercentile : null },
+        nearbyEventCount: typeof data.nearbyEventCount === "number" ? data.nearbyEventCount : 0, fetchedAt: displaySourceTime(event?.fetchedAt, "Updating"), safetyNotice: typeof event?.safetyNotice === "string" ? event.safetyNotice : "Modelled screening only; follow official local warnings.",
+      };
+      setSourceMonitoring(previous => ({ ...previous, outlook }));
+    });
     const feedIds = ["gdacs-latest", "nasa-eonet-open", "ifrc-latest", "who-outbreak-news", "gistda-flood-latest", "hko-warnings-latest", "canada-weather-alerts-latest", "england-flood-warnings-latest"];
     const stopFeeds = feedIds.map((id) => onSnapshot(doc(firestore, "sourceEvents", id), (snapshot) => setFeed(id, snapshot.data())));
-    return () => { stopAirQuality(); stopRiver(); stopFeeds.forEach((stop) => stop()); };
+    return () => { stopAirQuality(); stopRiver(); stopOutlook(); stopFeeds.forEach((stop) => stop()); };
   }, []);
   return sourceMonitoring;
 }
@@ -636,23 +721,30 @@ const shortcuts = [
 ];
 
 function Brand() {
-  return <div className="brand"><Image className="brand-maya-logo" src="/mascots/maya.jpeg" alt="MyanAid logo" width={64} height={64} priority /><div><div className="brand-name">MyanAid</div><div className="brand-tagline">Prepared. Informed. Safer together.</div></div></div>;
+  const { t } = useAppI18n();
+  return <div className="brand"><Image className="brand-maya-logo" src="/mascots/maya.jpeg" alt="MyanAid logo" width={64} height={64} priority /><div><div className="brand-name">MyanAid</div><div className="brand-tagline">{t("brand.tagline")}</div></div></div>;
 }
 
-function Header({ onLocation, locationLabel, locationLoading, language, setLanguage, onProfile, user }: { onLocation: () => void; locationLabel: string; locationLoading: boolean; language: string; setLanguage: (language: string) => void; onProfile: () => void; user: User | null }) {
+function Header({ onLocation, locationLabel, locationLoading, locale, setLocale, onProfile, user }: { onLocation: () => void; locationLabel: string; locationLoading: boolean; locale: AppLocale; setLocale: (locale: AppLocale) => void; onProfile: () => void; user: AppUser | null }) {
   const [languageOpen, setLanguageOpen] = useState(false);
-  const languages = [{ label: "English", flag: "🇬🇧" }, { label: "မြန်မာ", flag: "🇲🇲" }, { label: "ไทย", flag: "🇹🇭" }, { label: "Bahasa Indonesia", flag: "🇮🇩" }];
-  const activeLanguage = languages.find((item) => item.label === language) ?? languages[0];
+  const { t } = useAppI18n();
+  const activeLanguage = appLanguages.find((item) => item.code === locale) ?? appLanguages[0];
+
+  const handleLanguageChange = (item: typeof appLanguages[0]) => {
+    setLocale(item.code);
+    setLanguageOpen(false);
+  };
+
   return <header className="header">
     <div className="header-inner">
       <Brand />
       <div className="header-actions">
-        <Action className="location-pill" onClick={onLocation}><Icon name="location" size="sm" /><span>{locationLoading ? "Finding your location…" : locationLabel}</span><Icon name="chevron" size="sm" /></Action>
+        <Action className="location-pill" onClick={onLocation}><Icon name="location" size="sm" /><span>{locationLoading ? t("findingLocation") : locationLabel}</span><Icon name="chevron" size="sm" /></Action>
         <div className="language-wrap">
-          <Action className="icon-pill language-toggle" onClick={() => setLanguageOpen(!languageOpen)}><span className="language-flag" aria-hidden="true">{activeLanguage.flag}</span><span className="language-name">{language}</span><Icon name="chevron" size="sm" /></Action>
-          {languageOpen && <div className="language-menu"><div className="menu-label">Language</div>{languages.map((item) => <Action key={item.label} className={`menu-item ${language === item.label ? "selected" : ""}`} onClick={() => { setLanguage(item.label); setLanguageOpen(false); }}><span className="language-menu-name"><span className="language-menu-flag" aria-hidden="true">{item.flag}</span>{item.label}</span>{language === item.label && <Icon name="check" size="sm" />}</Action>)}</div>}
+          <Action className="icon-pill language-toggle" onClick={() => setLanguageOpen(!languageOpen)}><span className="language-flag" aria-hidden="true">{activeLanguage.flag}</span><span className="language-name">{activeLanguage.label}</span><Icon name="chevron" size="sm" /></Action>
+          {languageOpen && <div className="language-menu"><div className="menu-label">{t("language")}</div>{appLanguages.map((item) => <Action key={item.code} className={`menu-item ${locale === item.code ? "selected" : ""}`} onClick={() => handleLanguageChange(item)}><span className="language-menu-name"><span className="language-menu-flag" aria-hidden="true">{item.flag}</span>{item.label}</span>{locale === item.code && <Icon name="check" size="sm" />}</Action>)}</div>}
         </div>
-        <Action className="square-action profile-action" ariaLabel={user ? "Open profile" : "Sign in"} onClick={onProfile}><Icon name="profile" /></Action>
+        <Action className="square-action profile-action" ariaLabel={user ? t("openProfile") : t("signIn")} onClick={onProfile}><Icon name="profile" /></Action>
       </div>
     </div>
   </header>;
@@ -702,50 +794,87 @@ function MascotNameSync({ mascotId }: { mascotId: MascotId }) {
   return null;
 }
 
-function StatusCard({ onMap, onGuidance, condition, observedAt, weather, visualPreview }: { onMap: () => void; onGuidance: () => void; condition: LocalCondition; observedAt?: string; weather: LiveWeather | null; visualPreview?: HeroWeatherAnimation }) {
+function StatusCard({ onMap, onGuidance, onOutlook, condition, observedAt, weather, outlook, visualPreview }: { onMap: () => void; onGuidance: () => void; onOutlook: () => void; condition: LocalCondition; observedAt?: string; weather: LiveWeather | null; outlook: WeatherOutlook | null; visualPreview?: HeroWeatherAnimation }) {
+  const { t } = useAppI18n();
   const animation = visualPreview ?? heroWeatherAnimation(weather, condition);
   return <section className={`status-card severity-${condition.severity}`}>
     <HeroWeatherMotion variant={animation} />
-    <div className="status-main"><div className="hero-status-row"><div className={`hero-severity severity-${condition.severity}`}>{condition.label}</div></div><h1>{condition.headline}</h1><div className="status-location"><Icon name="location" size="sm" /><span className="hero-location-name">Bangkok, Thailand</span><span className="hero-observed-at">· {formatHeroObservedAt(observedAt)}</span></div></div>
-    <div className="hero-priority-facts">{condition.facts.map((fact) => <span key={fact.label}><Icon name={fact.icon} size="sm" /><b>{fact.value}</b><small>{fact.label}</small></span>)}</div>
-    <div className="hero-actions"><Action className="guidance-button" onClick={onGuidance}><Icon name="shield" size="sm" /><span>What to do now</span><Icon name="arrow" size="sm" /></Action><Action className="map-button secondary" onClick={onMap}><Icon name="map" size="sm" /><span>Live map</span></Action></div>
+    <div className="status-main">
+      <div className="hero-status-row">
+        <div className={`hero-severity severity-${condition.severity}`}>
+          <PublicTranslation text={condition.label} />
+        </div>
+      </div>
+      <h1><PublicTranslation text={condition.headline} /></h1>
+      <div className="status-location">
+        <Icon name="location" size="sm" />
+        <span className="hero-location-name">Bangkok, Thailand</span>
+        <span className="hero-observed-at">· {formatHeroObservedAt(observedAt)}</span>
+      </div>
+    </div>
+    
+    <div className="hero-priority-facts">
+      {condition.facts.map((fact) => <span key={fact.label}><Icon name={fact.icon} size="sm" /><b>{fact.value}</b><small><PublicTranslation text={fact.label} /></small></span>)}
+    </div>
+    
+    <div className="hero-actions">
+      <Action className="guidance-button" onClick={onGuidance}><Icon name="shield" size="sm" /><span>{t("hero.action")}</span><Icon name="arrow" size="sm" /></Action>
+      <Action className="map-button secondary" onClick={onMap}><Icon name="map" size="sm" /><span>{t("hero.map")}</span></Action>
+    </div>
+
+    {/* Relocated Advance Outlook section at the bottom of the card */}
+    {outlook && (
+      <div className="hero-card-footer">
+        <button type="button" className={`hero-outlook-pill ${outlook.level}`} onClick={onOutlook} aria-label={`Open advance weather outlook, score ${outlook.score} out of 100`}>
+          <span className="hero-outlook-spark"><Icon name="sparkle" size="sm" /></span>
+          <span className="hero-outlook-info">
+            <b>Advance outlook</b>
+            <small>{outlook.level === "elevated" ? "Elevated attention" : outlook.level === "watch" ? "Weather watch" : "Next 72 hours"}</small>
+          </span>
+          <strong className="hero-outlook-score">{outlook.score}<small>/100</small></strong>
+          <Icon name="arrow" size="sm" />
+        </button>
+      </div>
+    )}
   </section>;
 }
 
 function NearYou({ onLocalGuide, onMap, monitoring }: { onLocalGuide: () => void; onMap: () => void; monitoring: LiveMonitoringState }) {
+  const { t } = useAppI18n();
   const weather = monitoring.weather;
   const condition = localCondition(weather);
-  const localDetails = weather ? `${weather.rain} mm rain · ${weather.wind} km/h wind · Updated ${formatHeroObservedAt(weather.observedAt)}` : "Checking the latest local weather observation";
+  const localDetails = weather ? `${weather.rain} mm rain · ${weather.wind} km/h wind · Last checked ${formatHeroObservedAt(weather.observedAt)}` : t("checkingWeather");
   return <section className="near-section">
     <div className="near-local-panel">
       <div className="near-local-header">
-        <div><span className="near-local-kicker"><Icon name="location" size="sm" />Near you</span><h2>Bangkok, Thailand</h2></div>
-        <Action className="near-map-action" onClick={onMap}>View map <Icon name="arrow" size="sm" /></Action>
+        <div><span className="near-local-kicker"><Icon name="location" size="sm" />{t("nearYou")}</span><h2>Bangkok, Thailand</h2></div>
+        <Action className="near-map-action" onClick={onMap}>{t("viewMap")} <Icon name="arrow" size="sm" /></Action>
       </div>
       <div className="near-observation-card">
         <span className={`near-observation-icon severity-${condition.severity}`}><Icon name={condition.icon} /></span>
-        <div><span>Current local weather safety</span><strong>{condition.headline}</strong><small>{localDetails}</small></div>
+        <div><span>{t("currentWeatherSafety")}</span><strong><PublicTranslation text={condition.headline} /></strong><small>{weather ? <PublicTranslation text={localDetails} /> : localDetails}</small></div>
       </div>
-      <Action className="near-guide-action" onClick={onLocalGuide}><Icon name="shield" size="sm" />Read local guide <Icon name="arrow" size="sm" /></Action>
+      <Action className="near-guide-action" onClick={onLocalGuide}><Icon name="shield" size="sm" />{t("readLocalGuide")} <Icon name="arrow" size="sm" /></Action>
     </div>
   </section>;
 }
 
 function LiveMonitoring({ monitoring }: { monitoring: LiveMonitoringState }) {
+  const { t } = useAppI18n();
   const weather = monitoring.weather;
   const earthquake = monitoring.earthquake;
   const weatherTone = weatherMonitoringTone(weather);
   const earthquakeTone = earthquakeMonitoringTone(earthquake);
   return <section className="section live-monitoring-section">
-    <SectionTitle title="Live data" subtitle={monitoring.loading ? "Connecting to public data sources…" : `Last checked ${monitoring.fetchedAt ?? "just now"}`} />
+    <SectionTitle title={t("liveData")} subtitle={monitoring.loading ? t("connectingSources") : t("lastChecked", { value: monitoring.fetchedAt ?? t("updatedNow") })} />
     <div className="live-data-grid compact-live-grid">
       <article className={`live-data-card weather-live-card tone-${weatherTone}`}>
-        <div className="live-data-top"><div className="live-data-icon"><Icon name={weather ? weatherVisualIcon(weather.code) : "rain"} /></div><div><span>Bangkok conditions</span><strong>{weather?.source === "Google Weather" ? "Google Weather conditions" : "Open-Meteo forecast"}</strong></div><span className="source-pill">{weather?.source === "Google Weather" ? "Current ·" : "Modelled ·"} {monitoringToneLabel[weatherTone]}</span></div>
-        {weather ? <><div className="live-weather-reading"><strong>{weather.temperature}°</strong><span>{weather.description ?? weatherLabel(weather.code)}</span></div><div className="live-data-facts"><span><Icon name="rain" size="sm" />{weather.rain} mm rain</span><span><Icon name="wind" size="sm" />{weather.wind} km/h</span></div></> : <p className="live-empty">Weather data is temporarily unavailable.</p>}
+        <div className="live-data-top"><div className="live-data-icon"><Icon name={weather ? weatherVisualIcon(weather.code) : "rain"} /></div><div><span><PublicTranslation text="Bangkok conditions" /></span><strong><PublicTranslation text={weather?.source === "Google Weather" ? "Google Weather conditions" : "Open-Meteo forecast"} /></strong></div><span className="source-pill"><PublicTranslation text={`${weather?.source === "Google Weather" ? "Current" : "Modelled"} · ${monitoringToneLabel[weatherTone]}`} /></span></div>
+        {weather ? <><div className="live-weather-reading"><strong>{weather.temperature}°</strong><span><PublicTranslation text={weather.description ?? weatherLabel(weather.code)} /></span></div><div className="live-data-facts"><span><Icon name="rain" size="sm" /><PublicTranslation text={`${weather.rain} mm rain`} /></span><span><Icon name="wind" size="sm" />{weather.wind} km/h</span></div></> : <p className="live-empty"><PublicTranslation text="Weather data is temporarily unavailable." /></p>}
       </article>
       <article className={`live-data-card quake-live-card tone-${earthquakeTone}`}>
-        <div className="live-data-top"><div className="live-data-icon"><Icon name="earthquake" /></div><div><span>Global earthquakes M4.5+</span><strong>USGS live feed</strong></div><span className="source-pill official">Scientific · {monitoringToneLabel[earthquakeTone]}</span></div>
-        {earthquake ? <><div className="live-quake-reading"><strong>M{earthquake.magnitude.toFixed(1)}</strong><span>{earthquake.place}</span></div><a className="live-source-link" href={earthquake.url} target="_blank" rel="noreferrer">Source details <Icon name="arrow" size="sm" /></a></> : <p className="live-empty">No M4.5+ event is currently listed.</p>}
+        <div className="live-data-top"><div className="live-data-icon"><Icon name="earthquake" /></div><div><span><PublicTranslation text="Global earthquakes M4.5+" /></span><strong><PublicTranslation text="USGS live feed" /></strong></div><span className="source-pill official"><PublicTranslation text={`Scientific · ${monitoringToneLabel[earthquakeTone]}`} /></span></div>
+        {earthquake ? <><div className="live-quake-reading"><strong>M{earthquake.magnitude.toFixed(1)}</strong><span><PublicTranslation text={earthquake.place} /></span></div><a className="live-source-link" href={earthquake.url} target="_blank" rel="noreferrer"><PublicTranslation text="Source details" /> <Icon name="arrow" size="sm" /></a></> : <p className="live-empty"><PublicTranslation text="No M4.5+ event is currently listed." /></p>}
       </article>
     </div>
   </section>;
@@ -756,24 +885,24 @@ function SourceMonitoring({ sourceMonitoring, onSelectEvent }: { sourceMonitorin
   const [expanded, setExpanded] = useState(false);
   if (!airQuality && !river && !feeds.length) return null;
   return <section className="section source-monitoring-section compact-signal-section">
-    <div className="global-kicker"><Icon name="shield" size="sm" />Provider-source monitoring</div>
-    <SectionTitle title="More safety signals" subtitle="A compact view of current provider data." />
+    <div className="global-kicker"><Icon name="shield" size="sm" /><PublicTranslation text="Provider-source monitoring" /></div>
+    <SectionTitle title={<PublicTranslation text="More safety signals" />} subtitle={<PublicTranslation text="A compact view of current provider data." />} />
     {(airQuality || river) && <div className="source-condition-grid">
       {airQuality && <article className="source-condition-card air-condition-card">
-        <div className="source-condition-head"><div className="live-data-icon"><Icon name="air" /></div><div><span>Bangkok air quality</span><strong>Open-Meteo model</strong></div><span className="source-pill">Modelled</span></div>
+        <div className="source-condition-head"><div className="live-data-icon"><Icon name="air" /></div><div><span><PublicTranslation text="Bangkok air quality" /></span><strong><PublicTranslation text="Open-Meteo model" /></strong></div><span className="source-pill"><PublicTranslation text="Modelled" /></span></div>
         <div className="source-condition-reading"><strong>AQI {airQuality.usAqi}</strong><span>PM2.5 {airQuality.pm25} µg/m³ · PM10 {airQuality.pm10} µg/m³</span></div>
-        <p>{airQuality.observedAt} · This is modelled air quality, not a regulatory monitor reading.</p>
+        <p><PublicTranslation text={`${airQuality.observedAt} · This is modelled air quality, not a regulatory monitor reading.`} /></p>
       </article>}
       {river && <article className="source-condition-card river-condition-card">
-        <div className="source-condition-head"><div className="live-data-icon"><Icon name="flood" /></div><div><span>Bangkok river model</span><strong>Open-Meteo flood API</strong></div><span className="source-pill">Forecast</span></div>
-        <div className="source-condition-reading"><strong>{river.discharge} m³/s</strong><span>Modelled discharge for {river.date}</span></div>
-        <p>Discharge is not flood depth, street conditions, dam status, or an evacuation instruction.</p>
+        <div className="source-condition-head"><div className="live-data-icon"><Icon name="flood" /></div><div><span><PublicTranslation text="Bangkok river model" /></span><strong><PublicTranslation text="Open-Meteo flood API" /></strong></div><span className="source-pill"><PublicTranslation text="Forecast" /></span></div>
+        <div className="source-condition-reading"><strong>{river.discharge} m³/s</strong><span><PublicTranslation text={`Modelled discharge for ${river.date}`} /></span></div>
+        <p><PublicTranslation text="Discharge is not flood depth, street conditions, dam status, or an evacuation instruction." /></p>
       </article>}
     </div>}
     {!!feeds.length && <div className="provider-feed-grid">{(expanded ? feeds : feeds.slice(0, 1)).map((feed) => <article className="provider-feed-card" key={feed.id}>
-      <div className="provider-feed-head"><div><span>{feed.kind.replaceAll("_", " ")}</span><h3>{feed.provider}</h3></div><span className="feed-count">{feed.events.length} records</span></div>
+      <div className="provider-feed-head"><div><span><PublicTranslation text={feed.kind.replaceAll("_", " ")} /></span><h3>{feed.provider}</h3></div><span className="feed-count"><PublicTranslation text={`${feed.events.length} records`} /></span></div>
       <div className="provider-event-list">{feed.events.slice(0, expanded ? 3 : 1).map((event) => <button type="button" className="provider-event" key={event.id} onClick={() => onSelectEvent(event, feed)}>
-        <div><span className="provider-event-category">{event.category} · {event.severity}</span><strong>{event.title}</strong><p><Icon name="location" size="sm" />{event.location}</p>{event.summary && <small>{event.summary}</small>}</div><Icon name="arrow" size="sm" />
+        <div><span className="provider-event-category"><PublicTranslation text={`${event.category} · ${event.severity}`} /></span><strong><PublicTranslation text={event.title} /></strong><p><Icon name="location" size="sm" />{event.location}</p>{event.summary && <small><PublicTranslation text={event.summary} /></small>}</div><Icon name="arrow" size="sm" />
       </button>)}</div>
       {expanded && <p className="provider-feed-notice">{feed.safetyNotice}</p>}
     </article>)}</div>}
@@ -815,11 +944,39 @@ function SourceEventDrawer({ event, feed, onClose }: { event: SourceFeedItem; fe
   </aside></div>;
 }
 
-function SectionTitle({ title, subtitle, action, onAction }: { title: string; subtitle?: string; action?: string; onAction?: () => void }) {
+function SectionTitle({ title, subtitle, action, onAction }: { title: React.ReactNode; subtitle?: React.ReactNode; action?: string; onAction?: () => void }) {
   return <div className="section-title"><div><h2>{title}</h2>{subtitle && <p>{subtitle}</p>}</div>{action && <Action className="text-action" onClick={onAction}>{action}<Icon name="arrow" size="sm" /></Action>}</div>;
 }
 
-function Home({ onMap, onCategory, onAlert, onPreparedness, onLocalGuide, savedLocations, monitoring, sourceMonitoring, mascotId }: { onMap: () => void; onCategory: (title: string) => void; onAlert: (alert: AlertData) => void; onPreparedness: (tab: "kit" | "family" | "shelters" | "aid") => void; onLocalGuide: () => void; savedLocations: SavedLocation[]; monitoring: LiveMonitoringState; sourceMonitoring: SourceMonitoringState; mascotId: MascotId }) {
+function AdvancedWeatherOutlook({ outlook }: { outlook: WeatherOutlook | null }) {
+  if (!outlook) return null;
+  const levelLabel = outlook.level === "elevated" ? "Elevated attention" : outlook.level === "watch" ? "Weather watch" : "Routine outlook";
+  return <section className={`advance-outlook ${outlook.level}`} aria-label="Advance weather outlook">
+    <div className="advance-outlook-head"><div><span className="eyebrow">Advance weather outlook</span><h2><PublicTranslation text={levelLabel} /></h2><p><PublicTranslation text={`${outlook.window} · refreshed ${outlook.fetchedAt}`} /></p></div><strong>{outlook.score}<small>/100</small></strong></div>
+    <div className="advance-outlook-metrics"><span><b>{outlook.forecast.maxProbability}%</b><small>peak rain chance</small></span><span><b>{outlook.forecast.maxRainMm} mm</b><small>peak forecast rain</small></span><span><b>{outlook.forecast.maxWindGustKph} km/h</b><small>peak gust</small></span></div>
+    <div className="advance-outlook-copy"><h3>Why this is showing</h3><ul>{outlook.factors.length ? outlook.factors.map((factor) => <li key={factor}><PublicTranslation text={factor} /></li>) : <li>Forecast inputs are currently low-risk.</li>}</ul>{outlook.historical.completedDays > 0 && <p>Recent context: {outlook.historical.wetDays} wet days in the last {outlook.historical.completedDays} completed days{outlook.historical.forecastRainPercentile !== null ? `; peak forecast rain is around the ${outlook.historical.forecastRainPercentile}th percentile of that period.` : "."}</p>}</div>
+    <div className="advance-outlook-actions"><h3>Suggested preparation</h3>{outlook.suggestions.map((suggestion) => <p key={suggestion}><Icon name="shield" size="sm" /><PublicTranslation text={suggestion} /></p>)}</div>
+    <small className="advance-outlook-note">Modelled screening · {outlook.confidence} confidence · <PublicTranslation text={outlook.safetyNotice} /></small>
+  </section>;
+}
+
+function AdvanceOutlookDialog({ outlook, onClose }: { outlook: WeatherOutlook; onClose: () => void }) {
+  const reminder = advanceOutlookReminder(outlook);
+  return <div className="overlay advance-outlook-overlay" role="dialog" aria-modal="true" aria-labelledby="advance-outlook-title" onClick={onClose}>
+    <section className="advance-outlook-sheet" onClick={(event) => event.stopPropagation()}>
+      <header><div><span className="eyebrow">Advance weather outlook</span><h1 id="advance-outlook-title">Plan ahead with the next 72 hours</h1></div><button type="button" onClick={onClose} aria-label="Close advance weather outlook"><Icon name="close" size="sm" /></button></header>
+      <AdvancedWeatherOutlook outlook={outlook} />
+      <section className="advance-reminder-payload" data-reminder={reminder.text} aria-label="Device reminder summary">
+        <div><Icon name="sound" size="sm" /><div><span>Device reminder summary</span><strong>Ready for opt-in mascot and widget alerts</strong></div></div>
+        <p>{reminder.text}</p>
+        <small>This message is not played, shown outside the app, or sent as a notification until the person enables that device permission.</small>
+      </section>
+    </section>
+  </div>;
+}
+
+function Home({ onMap, onCategory, onAlert, onPreparedness, onLocalGuide, onOutlook, savedLocations, monitoring, sourceMonitoring, mascotId }: { onMap: () => void; onCategory: (title: string) => void; onAlert: (alert: AlertData) => void; onPreparedness: (tab: "kit" | "family" | "shelters" | "aid") => void; onLocalGuide: () => void; onOutlook: () => void; savedLocations: SavedLocation[]; monitoring: LiveMonitoringState; sourceMonitoring: SourceMonitoringState; mascotId: MascotId }) {
+  const { t } = useAppI18n();
   const condition = localCondition(monitoring.weather);
   const [heroPreview, setHeroPreview] = useState<HeroWeatherAnimation | null>(null);
   const [heroPreviewEnabled, setHeroPreviewEnabled] = useState(false);
@@ -845,20 +1002,20 @@ function Home({ onMap, onCategory, onAlert, onPreparedness, onLocalGuide, savedL
   return <main>
     <div className="hero-wash" />
     <div className="content">
-      <StatusCard onMap={onMap} onGuidance={onLocalGuide} condition={condition} observedAt={monitoring.weather?.observedAt} weather={monitoring.weather} visualPreview={heroPreview ?? undefined} />
-      {heroPreviewEnabled && <section className="hero-scene-preview" aria-label="Hero weather scene preview"><span>Visual preview</span><div>{heroWeatherVariants.map((variant) => <button type="button" className={heroPreview === variant ? "active" : ""} onClick={() => setHeroPreview(variant)} key={variant}>{variant}</button>)}</div></section>}
+      <StatusCard onMap={onMap} onGuidance={onLocalGuide} onOutlook={onOutlook} condition={condition} observedAt={monitoring.weather?.observedAt} weather={monitoring.weather} outlook={sourceMonitoring.outlook} visualPreview={heroPreview ?? undefined} />
+      {heroPreviewEnabled && <section className="hero-scene-preview" aria-label="Hero weather scene preview"><span>{t("visualPreview")}</span><div>{heroWeatherVariants.map((variant) => <button type="button" className={heroPreview === variant ? "active" : ""} onClick={() => setHeroPreview(variant)} key={variant}>{variant}</button>)}</div></section>}
       <NearYou onLocalGuide={onLocalGuide} onMap={onMap} monitoring={monitoring} />
       <LiveMonitoring monitoring={monitoring} />
       <section className="section category-home-section">
-        <SectionTitle title="Emergency categories" />
+        <SectionTitle title={t("emergencyCategories")} />
         <div className="category-grid">{categories.map((item) => <Action key={item.title} className={`category-card ${categoryIsEmergency(item.title) ? "watched" : "inactive"}`} onClick={() => onCategory(item.title)}>
           <div className="category-icon category-icon-3d"><Emergency3DIcon name={item.icon as EmergencyIconName} /></div>
-          <div className="category-copy"><h3>{item.title}</h3><p>{item.description}</p><div className={`category-status ${item.tone}`}><span />{categorySignal(item.title)}</div></div>
+          <div className="category-copy"><h3><PublicTranslation text={item.title} /></h3><p><PublicTranslation text={item.description} /></p><div className={`category-status ${item.tone}`}><span /><PublicTranslation text={categorySignal(item.title)} /></div></div>
           <Icon name="chevron" />
         </Action>)}</div>
       </section>
-      <section className="section home-action-hub preparedness-home-hub"><div className="home-hub-module"><SectionTitle title="Preparedness" subtitle="Make a plan before you need it" /><div className="compact-shortcut-grid">{shortcuts.map((item) => <Action key={item.title} className="compact-shortcut" onClick={() => onPreparedness(item.tab)}><div className="shortcut-icon shortcut-icon-3d"><Preparedness3DIcon name={item.icon as PreparednessIconName} /></div><span>{item.title}</span></Action>)}</div></div></section>
-      <div className="disclaimer"><Icon name="shield" size="sm" /><span>Information may change. Follow official local authorities for emergency instructions.</span></div>
+      <section className="section home-action-hub preparedness-home-hub"><div className="home-hub-module"><SectionTitle title={t("preparedness")} subtitle={t("makePlan")} /><div className="compact-shortcut-grid">{shortcuts.map((item) => <Action key={item.title} className="compact-shortcut" onClick={() => onPreparedness(item.tab)}><div className="shortcut-icon shortcut-icon-3d"><Preparedness3DIcon name={item.icon as PreparednessIconName} /></div><span><PublicTranslation text={item.title} /></span></Action>)}</div></div></section>
+      <div className="disclaimer"><Icon name="shield" size="sm" /><span>{t("disclaimer")}</span></div>
     </div>
   </main>;
 }
@@ -932,9 +1089,9 @@ function GoogleSourceMap({ points, mode = "roadmap", compact = false, currentLoc
   const [status, setStatus] = useState<"loading" | "ready" | "missing-key" | "3d-location-required" | "3d-map-id-required" | "street-location-required" | "street-unavailable" | "error">("loading");
   const apiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
   const mapId = process.env.NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID;
+
   useEffect(() => {
     if (!apiKey) { setStatus("missing-key"); return; }
-    if (!mapElement.current) return;
     let active = true;
     loadGoogleMaps(apiKey).then(async (google) => {
       if (!active || !mapElement.current) return;
@@ -943,17 +1100,19 @@ function GoogleSourceMap({ points, mode = "roadmap", compact = false, currentLoc
         resolve(location ? { lat: location.lat(), lng: location.lng() } : null);
       })) : null;
       if (!active || !mapElement.current) return;
+      
       const selectedPosition = searchedLocation ? { lat: searchedLocation.latitude, lng: searchedLocation.longitude } : currentLocation ? { lat: currentLocation.latitude, lng: currentLocation.longitude } : geocodedPosition;
       const firstPosition = selectedPosition ?? (points[0] ? { lat: points[0].coordinates.latitude, lng: points[0].coordinates.longitude } : { lat: 15, lng: 100 });
+      
       if (mode === "3d" && !selectedPosition) { setStatus("3d-location-required"); return; }
-      if (mode === "3d" && !mapId) { setStatus("3d-map-id-required"); return; }
+      
       if (mode === "street") {
         if (!selectedPosition) { setStatus("street-location-required"); return; }
         const panoramaService = new google.maps.StreetViewService();
         panoramaService.getPanorama({ location: selectedPosition, radius: 150 }, (panoramaData, panoramaStatus) => {
           if (!active || !mapElement.current) return;
           if (panoramaStatus === "OK" && panoramaData?.location?.latLng) {
-            new google.maps.StreetViewPanorama(mapElement.current, { position: panoramaData.location.latLng, pov: { heading: 0, pitch: 0 }, zoom: 1, addressControl: false, fullscreenControl: false, motionTracking: false });
+            new google.maps.StreetViewPanorama(mapElement.current, { position: panoramaData.location.latLng, pov: { heading: 0, pitch: 0 }, zoom: 1, addressControl: true, linksControl: true, panControl: true, enableCloseButton: false, motionTracking: true });
             setStatus("ready");
           } else {
             new google.maps.Map(mapElement.current, { center: selectedPosition, zoom: 16, mapTypeId: "roadmap", mapTypeControl: false, streetViewControl: false, fullscreenControl: false, gestureHandling: "cooperative" });
@@ -962,10 +1121,23 @@ function GoogleSourceMap({ points, mode = "roadmap", compact = false, currentLoc
         });
         return;
       }
+      
       const mapTypeId = mode === "3d" ? "satellite" : mode;
       const threeDimensionalFocus = mode === "3d" && Boolean(selectedPosition);
-      const map = new google.maps.Map(mapElement.current, { center: firstPosition, zoom: threeDimensionalFocus ? 17 : mode === "terrain" ? selectedPosition ? 10 : 5 : points.length === 1 ? 6 : 4, mapTypeId, ...(mode === "3d" ? { mapId } : {}), ...(mode === "3d" ? { tilt: 45, heading: 0 } : {}), mapTypeControl: false, streetViewControl: false, fullscreenControl: false, gestureHandling: "cooperative" });
-      if (mode === "3d") map.setTilt(45);
+      
+      const map = new google.maps.Map(mapElement.current, { 
+        center: firstPosition, 
+        zoom: threeDimensionalFocus ? 18 : mode === "terrain" ? selectedPosition ? 10 : 5 : points.length === 1 ? 6 : 4, 
+        mapTypeId, 
+        mapId: mapId || "DEMO_MAP_ID", 
+        ...(mode === "3d" ? { tilt: 67.5, heading: 45 } : {}), 
+        mapTypeControl: false, 
+        streetViewControl: false, 
+        fullscreenControl: false, 
+        gestureHandling: "cooperative" 
+      });
+      if (mode === "3d") map.setTilt(67.5);
+      
       const bounds = new google.maps.LatLngBounds();
       let areaPointCount = 0;
       points.forEach((point) => {
@@ -1034,11 +1206,24 @@ function GoogleSourceMap({ points, mode = "roadmap", compact = false, currentLoc
     }).catch(() => { if (active) setStatus("error"); });
     return () => { active = false; };
   }, [apiKey, compact, currentLocation, focusCurrentLocation, focusZoom, mapId, mode, nearbyFacilities, nearbySearchQuery, onNearbyPlaces, placeQuery, points, searchedLocation]);
-  if (status === "missing-key") return <div className="google-map-fallback"><Icon name="map" size="lg" /><strong>Map setup is incomplete</strong><span>Add a restricted Maps JavaScript API key to show provider event points.</span></div>;
-  if (status === "3d-location-required") return <div className="google-map-fallback"><Icon name="location" size="lg" /><strong>Choose a location for 3D</strong><span>Search for a place or use Near me first. MyanAid will then open genuine Google 3D imagery for that location.</span></div>;
-  if (status === "3d-map-id-required") return <div className="google-map-fallback"><Icon name="map" size="lg" /><strong>Google 3D needs a Maps Map ID</strong><span>Add <code>NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID</code> for this project, then 3D buildings and tilt can load for your selected location.</span></div>;
-  if (status === "error") return <div className="google-map-fallback"><Icon name="alert" size="lg" /><strong>Map is unavailable right now</strong><span>The provider records remain available below. Check the Maps key restrictions and try again.</span></div>;
-  return <div className="google-map-wrap"><div className="google-source-map" ref={mapElement} aria-label="Provider-published event point and affected-area map" />{status === "loading" && <div className="google-map-loading">Loading provider map…</div>}{status === "street-location-required" && <div className="street-view-notice"><Icon name="location" size="sm" />Search for a place or use Near me first. Street View never picks an unrelated provider pin.</div>}{status === "street-unavailable" && <div className="street-view-notice"><Icon name="location" size="sm" />No Street View imagery is available within 150 metres, so this view is showing your selected location on the road map.</div>}</div>;
+
+  const showMap = ["ready", "loading", "street-location-required", "street-unavailable"].includes(status);
+
+  return (
+    <>
+      {status === "missing-key" && <div className="google-map-fallback"><Icon name="map" size="lg" /><strong>Map setup is incomplete</strong><span>Add a restricted Maps JavaScript API key to show provider event points.</span></div>}
+      {status === "3d-location-required" && <div className="google-map-fallback"><Icon name="location" size="lg" /><strong>Choose a location for 3D</strong><span>Search for a place or use Near me first. MyanAid will then open genuine Google 3D imagery for that location.</span></div>}
+      {status === "3d-map-id-required" && <div className="google-map-fallback"><Icon name="map" size="lg" /><strong>Google 3D needs a Maps Map ID</strong><span>Add <code>NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID</code> for this project, then 3D buildings and tilt can load for your selected location.</span></div>}
+      {status === "error" && <div className="google-map-fallback"><Icon name="alert" size="lg" /><strong>Map is unavailable right now</strong><span>The provider records remain available below. Check the Maps key restrictions and try again.</span></div>}
+      
+      <div className="google-map-wrap" style={{ display: showMap ? "block" : "none" }}>
+        <div className="google-source-map" ref={mapElement} aria-label="Provider-published event point and affected-area map" />
+        {status === "loading" && <div className="google-map-loading">Loading provider map…</div>}
+        {status === "street-location-required" && <div className="street-view-notice"><Icon name="location" size="sm" />Search for a place or use Near me first. Street View never picks an unrelated provider pin.</div>}
+        {status === "street-unavailable" && <div className="street-view-notice"><Icon name="location" size="sm" />No Street View imagery is available within 150 metres, so this view is showing your selected location on the road map.</div>}
+      </div>
+    </>
+  );
 }
 
 function mapboxEventGeometry(event: SourceFeedItem & { coordinates: SourceCoordinates }) {
@@ -1075,6 +1260,16 @@ function GlobalEarthMap({ points, currentLocation, searchedLocation }: { points:
       map.addControl(new mapboxgl.NavigationControl({ visualizePitch: true }), "top-right");
       map.on("load", () => {
         if (!map) return;
+        
+        // ENHANCEMENT: Add atmospheric fog and space background
+        map.setFog({
+          "color": "rgb(186, 210, 235)",
+          "high-color": "rgb(36, 92, 223)",
+          "horizon-blend": 0.02,
+          "space-color": "rgb(11, 11, 25)",
+          "star-intensity": 0.6
+        });
+
         // Mapbox's current satellite style supplies its own globe atmosphere.
         // Resizing after layout prevents a blank WebGL canvas in mobile emulation.
         map.resize();
@@ -1130,10 +1325,11 @@ function GlobalEarthMap({ points, currentLocation, searchedLocation }: { points:
   }, [currentLocation, points, searchedLocation, token]);
   if (status === "missing-token") return <div className="earth-setup"><Icon name="globe" size="lg" /><strong>Global Earth needs a Mapbox public token</strong><span>Add <code>NEXT_PUBLIC_MAPBOX_ACCESS_TOKEN</code> to <code>.env.local</code>, then restart or deploy MyanAid. The local Google map remains available.</span></div>;
   if (status === "error") return <div className="earth-setup"><Icon name="alert" size="lg" /><strong>Global Earth is unavailable right now</strong><span>Check the Mapbox access-token restrictions and try again.</span></div>;
-  return <div className="global-earth-wrap"><div className="global-earth-map" ref={mapElement} aria-label="Interactive global provider event map" />{status === "loading" && <div className="google-map-loading">Loading Global Earth…</div>}<div className="earth-toolbar" aria-label="Global Earth controls"><button type="button" onClick={() => mapRef.current?.flyTo({ center: [104, 15], zoom: 1.25, bearing: 0, pitch: 0, essential: true })}><Icon name="globe" size="sm" /><span>Reset</span></button><button type="button" onClick={() => mapRef.current?.flyTo({ center: [100.5, 13.75], zoom: 3.2, bearing: 0, pitch: 0, essential: true })}><Icon name="location" size="sm" /><span>Asia</span></button><button type="button" onClick={() => mapRef.current?.easeTo({ bearing: 0, pitch: 0, duration: 500, essential: true })}><Icon name="alert" size="sm" /><span>North</span></button><button type="button" onClick={() => mapRef.current?.setPitch(mapRef.current.getPitch() > 0 ? 0 : 50)}><Icon name="map" size="sm" /><span>Tilt</span></button></div><div className="global-earth-caption"><Icon name="shield" size="sm" /><span>Exact provider points and published boundaries only. Rotate, tilt, and zoom to explore.</span></div></div>;
+  return <div className="global-earth-wrap"><div className="global-earth-map" ref={mapElement} aria-label="Interactive global provider event map" />{status === "loading" && <div className="google-map-loading">Loading Global Earth…</div>}<div className="earth-toolbar" aria-label="Global Earth controls"><button type="button" onClick={() => mapRef.current?.flyTo({ center: [104, 15], zoom: 1.25, bearing: 0, pitch: 0, essential: true })}><Icon name="globe" size="sm" /><span>Reset</span></button><button type="button" onClick={() => mapRef.current?.flyTo({ center: [100.5, 13.75], zoom: 3.2, bearing: 0, pitch: 0, essential: true })}><Icon name="location" size="sm" /><span>Asia</span></button><button type="button" onClick={() => mapRef.current?.setPitch(mapRef.current.getPitch() > 0 ? 0 : 50)}><Icon name="map" size="sm" /><span>Tilt</span></button></div><div className="global-earth-caption"><Icon name="shield" size="sm" /><span>Exact provider points and published boundaries only. Rotate, tilt, and zoom to explore.</span></div></div>;
 }
 
 function MapView({ onAlert, sourceMonitoring }: { onAlert: (alert: AlertData) => void; sourceMonitoring: SourceMonitoringState }) {
+  const { t } = useAppI18n();
   const [experience, setExperience] = useState<"local" | "earth">("local");
   const [filter, setFilter] = useState("All alerts");
   const [scope, setScope] = useState("Global");
@@ -1190,14 +1386,14 @@ function MapView({ onAlert, sourceMonitoring }: { onAlert: (alert: AlertData) =>
   };
   return <main className="map-page">
     <div className="map-toolbar">
-      <div className="map-heading"><div><h1>Live map</h1></div></div>
+      <div className="map-heading"><div><h1>{t("liveMap")}</h1></div></div>
       <form className="map-search-group" onSubmit={searchForLocation}>
-        <label className="map-search"><button type="submit" aria-label="Search location" disabled={searchingLocation}><Icon name="search" /></button><input value={searchTerm} onChange={(event) => setSearchTerm(event.target.value)} placeholder="Search a city, region or country" aria-label="Search a location" />{searchedLocation && <button type="button" className="map-search-clear" onClick={() => { setSearchTerm(""); setSearchedLocation(null); setLocationMessage("Showing the provider map."); }} aria-label="Clear location search"><Icon name="close" size="sm" /></button>}</label>
+        <label className="map-search"><button type="submit" aria-label="Search location" disabled={searchingLocation}><Icon name="search" /></button><input value={searchTerm} onChange={(event) => setSearchTerm(event.target.value)} placeholder={t("searchLocation")} aria-label="Search a location" />{searchedLocation && <button type="button" className="map-search-clear" onClick={() => { setSearchTerm(""); setSearchedLocation(null); setLocationMessage("Showing the provider map."); }} aria-label="Clear location search"><Icon name="close" size="sm" /></button>}</label>
       </form>
     </div>
-    <div className="map-control-row"><div className="map-experience-switch" aria-label="Map experience"><button type="button" className={experience === "local" ? "active" : ""} onClick={() => setExperience("local")}><Icon name="map" size="sm" />Map view</button><button type="button" className={experience === "earth" ? "active" : ""} onClick={() => setExperience("earth")}><Icon name="globe" size="sm" />Earth view</button></div><button type="button" className="map-near-button" onClick={askForLocation}><Icon name="location" size="sm" />Near me</button></div>
-    <div className="filter-row">{filters.map(x => <Action key={x} className={`filter-chip ${filter === x ? "active" : ""}`} onClick={() => setFilter(x)}>{x === "Flood" ? "Flood & water" : x === "Storm" ? "Storm & weather" : x}</Action>)}</div>
-    <section className={`provider-map-section ${experience === "earth" ? "global-earth-section" : ""}`}><div className="provider-map-heading"><div><div className="eyebrow">Provider-published map data</div><h2>{experience === "earth" ? "Global hazard explorer" : "Live source map"}</h2></div><span>{providerPoints.length} mapped record{providerPoints.length === 1 ? "" : "s"}</span></div>{experience === "local" && <div className="map-mode-switch" aria-label="Map view"><button type="button" className={mapMode === "roadmap" ? "active" : ""} onClick={() => chooseMapMode("roadmap")}>Map</button><button type="button" className={mapMode === "satellite" ? "active" : ""} onClick={() => chooseMapMode("satellite")}>Satellite</button><button type="button" className={mapMode === "terrain" ? "active" : ""} onClick={() => chooseMapMode("terrain")}>Terrain</button><button type="button" className={mapMode === "3d" ? "active" : ""} onClick={() => chooseMapMode("3d")}>3D</button><button type="button" className={mapMode === "street" ? "active" : ""} onClick={() => chooseMapMode("street")}>Street</button></div>}<div className="provider-map-legend"><span><i className="quake" />Earthquake</span><span><i className="storm" />Storm</span><span><i className="flood" />Flood & water</span><span><i className="fire" />Fire</span><span><i className="health" />Health</span><span><i className="other" />Other</span><span><i className="you" />Your location</span></div><div className="area-severity-legend"><span><i className="official" />Official mapped extent</span><span><i className="high" />High</span><span><i className="medium" />Moderate</span><span><i className="low" />Lower</span><small>Filled areas appear only when a provider publishes boundary geometry.</small></div>{experience === "local" && filter === "Flood" && officialFloodAreas.length > 0 && <div className="flood-area-picker"><span>Official flood areas</span><button type="button" className={!focusedFloodAreaId ? "active" : ""} onClick={() => setFocusedFloodAreaId(null)}>All areas</button>{officialFloodAreas.map((event, index) => <button type="button" className={focusedFloodAreaId === event.id ? "active" : ""} onClick={() => setFocusedFloodAreaId(event.id)} key={event.id}>Area {index + 1}</button>)}</div>}{experience === "earth" ? <GlobalEarthMap points={providerPoints} currentLocation={currentLocation} searchedLocation={searchedLocation?.coordinates} /> : <GoogleSourceMap points={providerPoints} mode={mapMode} currentLocation={currentLocation} focusCurrentLocation={scope === "Near you"} searchedLocation={searchedLocation?.coordinates} />}{locationMessage && <p className="map-location-message">{locationMessage}</p>}<p><Icon name="shield" size="sm" />{experience === "earth" ? "Global Earth is a visual explorer. It uses the same verified data as the local map, not a separate alert source." : "Pins are used for point-only records. Filled shapes are provider-published boundaries; blue means an official extent without a provider severity rating."}</p></section>
+    <div className="map-control-row"><div className="map-experience-switch" aria-label="Map experience"><button type="button" className={experience === "local" ? "active" : ""} onClick={() => setExperience("local")}><Icon name="map" size="sm" />{t("mapView")}</button><button type="button" className={experience === "earth" ? "active" : ""} onClick={() => setExperience("earth")}><Icon name="globe" size="sm" />{t("earthView")}</button></div><button type="button" className="map-near-button" onClick={askForLocation}><Icon name="location" size="sm" />{t("nearMe")}</button></div>
+    <div className="filter-row">{filters.map(x => <Action key={x} className={`filter-chip ${filter === x ? "active" : ""}`} onClick={() => setFilter(x)}>{x === "All alerts" ? t("allAlerts") : x === "Flood" ? "Flood & water" : x === "Storm" ? "Storm & weather" : x}</Action>)}</div>
+    <section className={`provider-map-section ${experience === "earth" ? "global-earth-section" : ""}`}><div className="provider-map-heading"><div><div className="eyebrow">Provider-published map data</div><h2>{experience === "earth" ? "Global hazard explorer" : "Live source map"}</h2></div><span>{providerPoints.length} mapped record{providerPoints.length === 1 ? "" : "s"}</span></div>{experience === "local" && <div className="map-mode-switch" aria-label="Map view"><button type="button" className={mapMode === "roadmap" ? "active" : ""} onClick={() => chooseMapMode("roadmap")}>Map</button><button type="button" className={mapMode === "satellite" ? "active" : ""} onClick={() => chooseMapMode("satellite")}>Satellite</button><button type="button" className={mapMode === "terrain" ? "active" : ""} onClick={() => chooseMapMode("terrain")}>Terrain</button><button type="button" className={mapMode === "3d" ? "active" : ""} onClick={() => chooseMapMode("3d")}>3D</button><button type="button" className={mapMode === "street" ? "active" : ""} onClick={() => chooseMapMode("street")}>Street</button></div>}<div className="provider-map-legend"><span><i className="quake" />Earthquake</span><span><i className="storm" />Storm</span><span><i className="flood" />Flood & water</span><span><i className="fire" />Fire</span><span><i className="health" />Health</span><span><i className="other" style={{ backgroundColor: "#10b981" }} />Other</span><span><i className="you" />Your location</span></div><div className="area-severity-legend"><span><i className="official" />Official mapped extent</span><span><i className="high" />High</span><span><i className="medium" />Moderate</span><span><i className="low" />Lower</span><small>Filled areas appear only when a provider publishes boundary geometry.</small></div>{experience === "local" && filter === "Flood" && officialFloodAreas.length > 0 && <div className="flood-area-picker"><span>Official flood areas</span><button type="button" className={!focusedFloodAreaId ? "active" : ""} onClick={() => setFocusedFloodAreaId(null)}>All areas</button>{officialFloodAreas.map((event, index) => <button type="button" className={focusedFloodAreaId === event.id ? "active" : ""} onClick={() => setFocusedFloodAreaId(event.id)} key={event.id}>Area {index + 1}</button>)}</div>}{experience === "earth" ? <GlobalEarthMap points={providerPoints} currentLocation={currentLocation} searchedLocation={searchedLocation?.coordinates} /> : <GoogleSourceMap points={providerPoints} mode={mapMode} currentLocation={currentLocation} focusCurrentLocation={scope === "Near you"} searchedLocation={searchedLocation?.coordinates} />}{locationMessage && <p className="map-location-message">{locationMessage}</p>}<p><Icon name="shield" size="sm" />{experience === "earth" ? "Global Earth is a visual explorer. It uses the same verified data as the local map, not a separate alert source." : "Pins are used for point-only records. Filled shapes are provider-published boundaries; blue means an official extent without a provider severity rating."}</p></section>
     {!process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY && <div className="world-map">
       <svg viewBox="0 0 1000 520" aria-label="Geographic world alert map">
         <g className="map-grid-lines">
@@ -1247,6 +1443,7 @@ function MapView({ onAlert, sourceMonitoring }: { onAlert: (alert: AlertData) =>
 }
 
 function AlertsView({ onAlert }: { onAlert: (alert: AlertData) => void }) {
+  const { t } = useAppI18n();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("All alerts");
   const [refreshing, setRefreshing] = useState(false);
@@ -1256,7 +1453,7 @@ function AlertsView({ onAlert }: { onAlert: (alert: AlertData) => void }) {
     setRefreshing(true);
     window.setTimeout(() => setRefreshing(false), 700);
   };
-  return <main className="inner-page content reference-screen alerts-reference"><div className="page-heading"><h1>Alerts</h1><button type="button" className={`refresh-button ${refreshing ? "is-refreshing" : ""}`} onClick={refreshAlerts} disabled={refreshing} aria-live="polite"><Icon name="refresh" size="sm" /><span>{refreshing ? "Refreshing…" : "Refresh"}</span></button></div><label className="reference-search"><Icon name="search" size="sm" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search place, event or source" /></label><div className="reference-filter-row">{["All alerts", "Flood & water", "Storm & weather", "Earthquake"].map((item) => <button type="button" className={filter === item ? "active" : ""} key={item} onClick={() => setFilter(item)}>{item}</button>)}</div><div className="results-row"><span>{visibleAlerts.length} updates</span><span>{refreshing ? "Checking updates…" : "Updated just now"}</span></div><div className="stacked-alerts">{visibleAlerts.map((a) => <Action className={`list-alert tone-${a.tone}`} key={a.id} onClick={() => onAlert(a)}><div className="alert-symbol"><Icon name={a.icon} /></div><div className="list-alert-copy"><div className="list-topline"><span className={`severity-label tone-${a.tone}`}>{a.severity}</span></div><h3>{a.title}</h3><p><Icon name="location" size="sm" />{a.location}</p><div className="alert-summary">{a.summary}</div><div className="source-line"><strong>{a.source}</strong></div><strong className="view-details">View details <Icon name="arrow" size="sm" /></strong></div></Action>)}</div></main>;
+  return <main className="inner-page content reference-screen alerts-reference"><div className="page-heading"><h1>{t("alerts")}</h1><button type="button" className={`refresh-button ${refreshing ? "is-refreshing" : ""}`} onClick={refreshAlerts} disabled={refreshing} aria-live="polite"><Icon name="refresh" size="sm" /><span>{refreshing ? t("refreshing") : t("refresh")}</span></button></div><label className="reference-search"><Icon name="search" size="sm" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("searchAlerts")} /></label><div className="reference-filter-row">{["All alerts", "Flood & water", "Storm & weather", "Earthquake"].map((item) => <button type="button" className={filter === item ? "active" : ""} key={item} onClick={() => setFilter(item)}>{item === "All alerts" ? t("allAlerts") : <PublicTranslation text={item} />}</button>)}</div><div className="results-row"><span>{visibleAlerts.length} {t("updates")}</span><span>{refreshing ? t("refreshing") : t("updatedNow")}</span></div><div className="stacked-alerts">{visibleAlerts.map((a) => <Action className={`list-alert tone-${a.tone}`} key={a.id} onClick={() => onAlert(a)}><div className="alert-symbol"><Icon name={a.icon} /></div><div className="list-alert-copy"><div className="list-topline"><span className={`severity-label tone-${a.tone}`}><PublicTranslation text={a.severity} /></span></div><h3><PublicTranslation text={a.title} /></h3><p><Icon name="location" size="sm" />{a.location}</p><div className="alert-summary"><PublicTranslation text={a.summary} /></div><div className="source-line"><strong>{a.source}</strong></div><strong className="view-details"><PublicTranslation text="View details" /> <Icon name="arrow" size="sm" /></strong></div></Action>)}</div></main>;
 }
 
 type PublicShelter = { id: string; name: string; latitude: number; longitude: number; shelterType: string; displayStatus: string; sourceStatus: string | null; source: string; sourceUrl: string; address: string; reportedCapacity: number | null; details: string; hazardSuitability: string; sourceUpdatedAt: string | null; distanceKm: number };
@@ -1267,7 +1464,7 @@ type FamilyGroupMember = { id: string; displayName: string; sharingEnabled: bool
 type FamilySharedLocation = { id: string; latitude: number; longitude: number; accuracy: number; updatedAt: Date | null; expiresAt: Date | null };
 type FamilySavedPlace = { id: string; label: string; address: string; latitude: number; longitude: number };
 
-function FamilyPlanJourney({ planLocation, weather, onAskCompanion, user, onSignIn, mascotId }: { planLocation: string; weather: LiveWeather | null; onAskCompanion: (prompt: string) => void; user: User | null; onSignIn: () => void; mascotId: MascotId }) {
+function FamilyPlanJourney({ planLocation, weather, onAskCompanion, user, onSignIn, mascotId }: { planLocation: string; weather: LiveWeather | null; onAskCompanion: (prompt: string) => void; user: AppUser | null; onSignIn: () => void; mascotId: MascotId }) {
   const mascot = findMascot(mascotId);
   const [members, setMembers] = useState<FamilyPlace[]>([]);
   const [draft, setDraft] = useState("");
@@ -1434,7 +1631,7 @@ function FamilyPlanJourney({ planLocation, weather, onAskCompanion, user, onSign
   </section>;
 }
 
-function PreparednessView({ locationLabel, savedLocations, monitoring, sourceMonitoring, currentCoordinates, requestCurrentLocation, onAskCompanion, selectedTab, user, onSignIn, mascotId }: { locationLabel: string; savedLocations: SavedLocation[]; monitoring: LiveMonitoringState; sourceMonitoring: SourceMonitoringState; currentCoordinates: SourceCoordinates | null; requestCurrentLocation: () => void; onAskCompanion: (prompt: string) => void; selectedTab: "kit" | "family" | "shelters" | "aid"; user: User | null; onSignIn: () => void; mascotId: MascotId }) {
+function PreparednessView({ locationLabel, savedLocations, monitoring, sourceMonitoring, currentCoordinates, requestCurrentLocation, onAskCompanion, selectedTab, user, onSignIn, mascotId }: { locationLabel: string; savedLocations: SavedLocation[]; monitoring: LiveMonitoringState; sourceMonitoring: SourceMonitoringState; currentCoordinates: SourceCoordinates | null; requestCurrentLocation: () => void; onAskCompanion: (prompt: string) => void; selectedTab: "kit" | "family" | "shelters" | "aid"; user: AppUser | null; onSignIn: () => void; mascotId: MascotId }) {
   const checklist = ["Drinking water", "Shelf-stable food", "Essential medicines", "First-aid supplies", "Torch & spare batteries", "Charged power bank", "Important documents", "Hygiene supplies", "Cash & emergency contacts"];
   const tabs: Array<{ id: "kit" | "familyJourney" | "shelters" | "aid"; title: string; icon: PreparednessIconName; description: string }> = [
     { id: "kit", title: "Emergency checklist", icon: "plan", description: "Build your essential kit" },
@@ -1540,7 +1737,7 @@ function PreparednessView({ locationLabel, savedLocations, monitoring, sourceMon
   </main>;
 }
 
-function ProfileView({ onPro, onLocations, onMascot, mascotId, user, onAuth, syncStatus, savedAlerts, onClearDetails }: { onPro: () => void; onLocations: () => void; onMascot: () => void; mascotId: MascotId; user: User | null; onAuth: () => void; syncStatus: "idle" | "saving" | "saved" | "error"; savedAlerts: AlertData[]; onClearDetails: () => void }) {
+function ProfileView({ onPro, onLocations, onMascot, mascotId, user, onAuth, syncStatus, savedAlerts, onClearDetails }: { onPro: () => void; onLocations: () => void; onMascot: () => void; mascotId: MascotId; user: AppUser | null; onAuth: () => void; syncStatus: "idle" | "saving" | "saved" | "error"; savedAlerts: AlertData[]; onClearDetails: () => void }) {
   const [tab, setTab] = useState<"details" | "alerts" | "privacy">("details");
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
@@ -1552,10 +1749,13 @@ function ProfileView({ onPro, onLocations, onMascot, mascotId, user, onAuth, syn
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [widgetHelpOpen, setWidgetHelpOpen] = useState(false);
   useEffect(() => {
-    if (!user || !db) return;
-    void getDoc(doc(db, "users", user.uid)).then((snapshot) => {
-      const profile = snapshot.data();
+    if (!user || (!usesNativeFirebase && !db)) return;
+    const load = usesNativeFirebase
+      ? FirebaseFirestore.getDocument({ reference: nativeProfileReference(user.uid) }).then(({ snapshot }) => snapshot.data)
+      : getDoc(doc(db!, "users", user.uid)).then((snapshot) => snapshot.data());
+    void load.then((profile) => {
       if (!profile) return;
       setName(typeof profile.displayName === "string" ? profile.displayName : "");
       setPhone(typeof profile.phone === "string" ? profile.phone : "");
@@ -1565,6 +1765,9 @@ function ProfileView({ onPro, onLocations, onMascot, mascotId, user, onAuth, syn
     }).catch(() => setNotice("Your profile could not be loaded. You can still update it."));
   }, [user]);
   useEffect(() => { document.documentElement.classList.toggle("high-contrast-mode", prefs.contrast); document.documentElement.classList.toggle("large-text-mode", prefs.largeText); }, [prefs.contrast, prefs.largeText]);
+  useEffect(() => {
+    void syncDeviceAlertPreferences({ notifications: prefs.notifications, audio: prefs.audio, companion: prefs.companion, widget: prefs.widget }).catch((error) => console.error("MyanAid device preference sync failed", error));
+  }, [prefs.notifications, prefs.audio, prefs.companion, prefs.widget]);
   const toggle = (key: keyof typeof prefs) => setPrefs(previous => ({ ...previous, [key]: !previous[key] }));
   const toggleCamera = async () => {
     if (!prefs.camera && navigator.mediaDevices?.getUserMedia) {
@@ -1578,14 +1781,14 @@ function ProfileView({ onPro, onLocations, onMascot, mascotId, user, onAuth, syn
     }
     toggle("camera");
   };
-  const save = async () => { if (!user || !db) return onAuth(); setSaving(true); try { let photoURL = avatarPreview; let uploadWarning = ""; if (avatarFile && storage) { try { const avatarRef = ref(storage, `profile-photos/${user.uid}/avatar`); await uploadBytes(avatarRef, avatarFile, { contentType: avatarFile.type }); photoURL = await getDownloadURL(avatarRef); setAvatarPreview(photoURL); setAvatarFile(null); } catch { photoURL = ""; uploadWarning = "Your details were saved, but profile-photo storage is not ready yet."; } } await setDoc(doc(db, "users", user.uid), { displayName: name, phone, emergencyContact: contact, photoURL: photoURL || null, preferences: prefs, updatedAt: serverTimestamp() }, { merge: true }); setNotice(uploadWarning || "Saved privately to your MyanAid profile."); } catch { setNotice("Could not save your changes. Please retry."); } finally { setSaving(false); } };
+  const save = async () => { if (!user || (!usesNativeFirebase && !db)) return onAuth(); setSaving(true); try { let photoURL = avatarPreview; let uploadWarning = ""; if (avatarFile && storage && !usesNativeFirebase) { try { const avatarRef = ref(storage, `profile-photos/${user.uid}/avatar`); await uploadBytes(avatarRef, avatarFile, { contentType: avatarFile.type }); photoURL = await getDownloadURL(avatarRef); setAvatarPreview(photoURL); setAvatarFile(null); } catch { photoURL = ""; uploadWarning = "Your details were saved, but profile-photo storage is not ready yet."; } } else if (avatarFile && usesNativeFirebase) { uploadWarning = "Your details were saved. Profile photo upload will be available in the next native update."; } const data = { displayName: name, phone, emergencyContact: contact, photoURL: photoURL || null, preferences: prefs, updatedAt: profileTimestamp() }; if (usesNativeFirebase) await FirebaseFirestore.setDocument({ reference: nativeProfileReference(user.uid), data, merge: true }); else await setDoc(doc(db!, "users", user.uid), data, { merge: true }); setNotice(uploadWarning || "Saved privately to your MyanAid profile."); } catch { setNotice("Could not save your changes. Please retry."); } finally { setSaving(false); } };
   const deleteAccount = async () => { if (!functions) return; try { await httpsCallable<Record<string, never>, { deleted: boolean }>(functions, "deleteMyAccount")({}); window.location.reload(); } catch { setNotice("Account deletion could not be completed. Please sign in again and retry."); } };
   const initial = (name || user?.email || "M").slice(0, 1).toUpperCase();
   const statusCopy = { idle: "Sign in to sync saved locations", saving: "Saving your protected profile…", saved: "Saved locations are synced privately", error: "Profile sync needs attention — check Firestore rules" }[syncStatus];
   const [openPanel, setOpenPanel] = useState<"details" | "alerts" | "privacy" | "saved" | "account" | null>(null);
-  const preferenceRows = ([ ["notifications", "Notifications", "New safety updates while the app is open."], ["audio", "Audio alerts", "Sound for high-priority alerts when notifications are enabled."], ["companion", "Mascot outside the app", "Available in supported device surfaces."], ["widget", "Emergency widget", "Home-screen widgets are not available yet."] ] as Array<[keyof typeof prefs, string, string]>);
+  const preferenceRows = ([ ["notifications", "Notifications", "New safety updates while the app is open."], ["audio", "Audio alerts", "Sound for high-priority alerts when notifications are enabled."], ["companion", "Mascot outside the app", "Available in supported device surfaces."], ["widget", "Emergency widget", "Enabled — add MyanAid from the iPhone widget gallery."] ] as Array<[keyof typeof prefs, string, string]>);
   const accessRows = ([ ["contrast", "High contrast", "Stronger text and clearer card boundaries."], ["largeText", "Large text", "More comfortable reading and controls."], ["location", "Precise location", "Requested only when you choose to share your location."], ["camera", "Camera & files", "Photos are selected by you. Camera access is never automatic."], ["analytics", "Anonymous diagnostics", "No diagnostics are collected without your permission."] ] as Array<[keyof typeof prefs, string, string]>);
-  return <main className="inner-page content reference-screen profile-reference"><div className="page-heading"><h1>Profile</h1><p>Your details, your companion, your preferences.</p></div><section className="profile-overview-card"><div className="profile-overview-icon">{avatarPreview ? <Image src={avatarPreview ?? ""} alt="Profile" width={56} height={56} unoptimized /> : initial}</div><div><span>Your personal space</span><h2>{name || "Your MyanAid profile"}</h2><p><Icon name="location" size="sm" />Bangkok, Thailand</p></div><button type="button" className="profile-edit-link" onClick={() => setOpenPanel(openPanel === "details" ? null : "details")}>Edit details <Icon name="arrow" size="sm" /></button></section><section className="profile-companion-card"><MascotIcon mascotId={mascotId} /><div><span>Your AI companion</span><h2>{findMascot(mascotId).name}</h2><p>Choose a familiar face for your everyday guidance.</p></div><button type="button" onClick={onMascot}>Change companion <Icon name="profile" size="sm" /></button></section>{openPanel === "details" && <section className="profile-settings-card detail-editor"><header><span className="profile-card-icon"><Icon name="profile" /></span><div><h2>Personal details</h2><p>Keep your safety information close.</p></div></header><div className="profile-form"><label>Display name<input value={name} onChange={e => setName(e.target.value)} placeholder="What should we call you?" /></label><label>Phone number <small>Optional</small><input value={phone} onChange={e => setPhone(e.target.value)} placeholder="Your phone number" /></label><label>Emergency contact <small>Optional</small><input value={contact} onChange={e => setContact(e.target.value)} placeholder="Name and phone number" /></label></div><div className="profile-inline-actions"><button type="button" onClick={onLocations}>Manage saved locations</button><button type="button" onClick={onAuth}>{user ? "Sign out" : "Sign in or create account"}</button></div><button type="button" className="ai-primary profile-save" onClick={() => void save()}>{saving ? "Saving…" : "Save personal details"}</button>{notice && <p className="profile-notice">{notice}</p>}</section>}<section className="profile-settings-card"><header><span className="profile-card-icon alert"><Icon name="bell" /></span><div><h2>Alert preferences</h2><p>Choose how you stay informed.</p></div><button type="button" className="card-expand" onClick={() => setOpenPanel(openPanel === "alerts" ? null : "alerts")} aria-label="Toggle alert preferences"><Icon name="chevron" size="sm" /></button></header>{openPanel === "alerts" && <div className="profile-card-content">{preferenceRows.map(([key, title, copy]) => <button type="button" className="preference-row" key={key} onClick={() => toggle(key)}><span><strong>{title}</strong><small>{copy}</small></span><i className={prefs[key] ? "switch on" : "switch"} /></button>)}<button type="button" className="ai-primary profile-save" onClick={() => void save()}>Save alert preferences</button></div>}</section><section className="profile-settings-card"><header><span className="profile-card-icon privacy"><Icon name="shield" /></span><div><h2>Accessibility & privacy</h2><p>Make MyanAid feel right for you.</p></div><button type="button" className="card-expand" onClick={() => setOpenPanel(openPanel === "privacy" ? null : "privacy")} aria-label="Toggle accessibility and privacy"><Icon name="chevron" size="sm" /></button></header>{openPanel === "privacy" && <div className="profile-card-content">{accessRows.map(([key, title, copy]) => <button type="button" className="preference-row" key={key} onClick={() => key === "camera" ? void toggleCamera() : toggle(key)}><span><strong>{title}</strong><small>{copy}</small></span>{["contrast", "largeText", "analytics"].includes(key) && <i className={prefs[key] ? "switch on" : "switch"} />}</button>)}<div className="disclaimer-card"><Icon name="shield" /><div><h3>Data sources & disclaimer</h3><p>MyanAid combines provider data and modelled forecasts. It is not an emergency service, evacuation order, or medical diagnosis.</p></div></div><button type="button" className="ai-primary profile-save" onClick={() => void save()}>Save accessibility settings</button></div>}</section><section className="profile-settings-card saved-alerts-card"><header><span className="profile-card-icon saved"><Icon name="alert" /></span><div><h2>Saved alerts</h2><p>{savedAlerts.length} saved {savedAlerts.length === 1 ? "alert" : "alerts"}</p></div><button type="button" className="card-expand" onClick={() => setOpenPanel(openPanel === "saved" ? null : "saved")} aria-label="Toggle saved alerts"><Icon name="chevron" size="sm" /></button></header>{openPanel === "saved" && <div className="profile-card-content">{savedAlerts.length ? <div className="saved-alert-list">{savedAlerts.map(alert => <article key={alert.id}><Icon name={alert.icon} size="sm" /><div><strong>{alert.title}</strong><span>{alert.location} · {alert.source}</span></div></article>)}</div> : <p className="empty-card-copy">Your bookmarked alerts will appear here.</p>}</div>}</section><section className="profile-settings-card account-data-card"><header><span className="profile-card-icon account"><Icon name="profile" /></span><div><h2>Account & data</h2><p>Your profile stays private and under your control.</p></div><button type="button" className="card-expand" onClick={() => setOpenPanel(openPanel === "account" ? null : "account")} aria-label="Toggle account and data"><Icon name="chevron" size="sm" /></button></header>{openPanel === "account" && <div className="profile-card-content"><p className="empty-card-copy">{statusCopy}. You can clear personal details from this device or permanently delete your signed-in account.</p><button type="button" className="clear-details-button" onClick={() => setConfirmClear(true)}>Clear personal details</button>{confirmDelete ? <div className="account-danger-actions"><button type="button" className="delete-account-button" onClick={() => void deleteAccount()}>Permanently delete my account</button><button type="button" className="cancel-delete-button" onClick={() => setConfirmDelete(false)}>Cancel</button></div> : <button type="button" className="delete-account-button" onClick={() => setConfirmDelete(true)}>Delete account</button>}</div>}</section>{confirmClear && <div className="overlay clear-details-overlay" role="dialog" aria-modal="true" aria-labelledby="clear-details-title"><section className="clear-details-dialog"><button type="button" className="clear-details-close" onClick={() => setConfirmClear(false)} aria-label="Close"><Icon name="close" size="sm" /></button><h2 id="clear-details-title">Clear personal details?</h2><p>This removes your name, photo, phone and emergency contact from this browser. Your saved alerts and preferences stay available.</p><button type="button" className="clear-details-confirm" onClick={() => { onClearDetails(); setName(""); setPhone(""); setContact(""); setAvatarPreview(""); setAvatarFile(null); setConfirmClear(false); }}>Clear personal details <Icon name="close" size="sm" /></button></section></div>}</main>;
+  return <main className="inner-page content reference-screen profile-reference"><div className="page-heading"><h1>Profile</h1><p>Your details, your companion, your preferences.</p></div><section className="profile-overview-card"><div className="profile-overview-icon">{avatarPreview ? <Image src={avatarPreview ?? ""} alt="Profile" width={56} height={56} unoptimized /> : initial}</div><div><span>Your personal space</span><h2>{name || "Your MyanAid profile"}</h2><p><Icon name="location" size="sm" />Bangkok, Thailand</p></div><button type="button" className="profile-edit-link" onClick={() => setOpenPanel(openPanel === "details" ? null : "details")}>Edit details <Icon name="arrow" size="sm" /></button></section><section className="profile-companion-card"><MascotIcon mascotId={mascotId} /><div><span>Your AI companion</span><h2>{findMascot(mascotId).name}</h2><p>Choose a familiar face for your everyday guidance.</p></div><button type="button" onClick={onMascot}>Change companion <Icon name="profile" size="sm" /></button></section>{openPanel === "details" && <section className="profile-settings-card detail-editor"><header><span className="profile-card-icon"><Icon name="profile" /></span><div><h2>Personal details</h2><p>Keep your safety information close.</p></div></header><div className="profile-form"><label>Display name<input value={name} onChange={e => setName(e.target.value)} placeholder="What should we call you?" /></label><label>Phone number <small>Optional</small><input value={phone} onChange={e => setPhone(e.target.value)} placeholder="Your phone number" /></label><label>Emergency contact <small>Optional</small><input value={contact} onChange={e => setContact(e.target.value)} placeholder="Name and phone number" /></label></div><div className="profile-inline-actions"><button type="button" onClick={onLocations}>Manage saved locations</button><button type="button" onClick={onAuth}>{user ? "Sign out" : "Sign in or create account"}</button></div><button type="button" className="ai-primary profile-save" onClick={() => void save()}>{saving ? "Saving…" : "Save personal details"}</button>{notice && <p className="profile-notice">{notice}</p>}</section>}<section className="profile-settings-card"><header><span className="profile-card-icon alert"><Icon name="bell" /></span><div><h2>Alert preferences</h2><p>Choose how you stay informed.</p></div><button type="button" className="card-expand" onClick={() => setOpenPanel(openPanel === "alerts" ? null : "alerts")} aria-label="Toggle alert preferences"><Icon name="chevron" size="sm" /></button></header>{openPanel === "alerts" && <div className="profile-card-content">{preferenceRows.map(([key, title, copy]) => <button type="button" className="preference-row" key={key} onClick={() => { toggle(key); if (key === "widget") setWidgetHelpOpen(true); }}><span><strong>{title}</strong><small>{copy}</small></span><i className={prefs[key] ? "switch on" : "switch"} /></button>)}<button type="button" className="ai-primary profile-save" onClick={() => void save()}>Save alert preferences</button></div>}</section><section className="profile-settings-card"><header><span className="profile-card-icon privacy"><Icon name="shield" /></span><div><h2>Accessibility & privacy</h2><p>Make MyanAid feel right for you.</p></div><button type="button" className="card-expand" onClick={() => setOpenPanel(openPanel === "privacy" ? null : "privacy")} aria-label="Toggle accessibility and privacy"><Icon name="chevron" size="sm" /></button></header>{openPanel === "privacy" && <div className="profile-card-content">{accessRows.map(([key, title, copy]) => <button type="button" className="preference-row" key={key} onClick={() => key === "camera" ? void toggleCamera() : toggle(key)}><span><strong>{title}</strong><small>{copy}</small></span>{["contrast", "largeText", "analytics"].includes(key) && <i className={prefs[key] ? "switch on" : "switch"} />}</button>)}<div className="disclaimer-card"><Icon name="shield" /><div><h3>Data sources & disclaimer</h3><p>MyanAid combines provider data and modelled forecasts. It is not an emergency service, evacuation order, or medical diagnosis.</p></div></div><button type="button" className="ai-primary profile-save" onClick={() => void save()}>Save accessibility settings</button></div>}</section><section className="profile-settings-card saved-alerts-card"><header><span className="profile-card-icon saved"><Icon name="alert" /></span><div><h2>Saved alerts</h2><p>{savedAlerts.length} saved {savedAlerts.length === 1 ? "alert" : "alerts"}</p></div><button type="button" className="card-expand" onClick={() => setOpenPanel(openPanel === "saved" ? null : "saved")} aria-label="Toggle saved alerts"><Icon name="chevron" size="sm" /></button></header>{openPanel === "saved" && <div className="profile-card-content">{savedAlerts.length ? <div className="saved-alert-list">{savedAlerts.map(alert => <article key={alert.id}><Icon name={alert.icon} size="sm" /><div><strong>{alert.title}</strong><span>{alert.location} · {alert.source}</span></div></article>)}</div> : <p className="empty-card-copy">Your bookmarked alerts will appear here.</p>}</div>}</section><section className="profile-settings-card account-data-card"><header><span className="profile-card-icon account"><Icon name="profile" /></span><div><h2>Account & data</h2><p>Your profile stays private and under your control.</p></div><button type="button" className="card-expand" onClick={() => setOpenPanel(openPanel === "account" ? null : "account")} aria-label="Toggle account and data"><Icon name="chevron" size="sm" /></button></header>{openPanel === "account" && <div className="profile-card-content"><p className="empty-card-copy">{statusCopy}. You can clear personal details from this device or permanently delete your signed-in account.</p><button type="button" className="clear-details-button" onClick={() => setConfirmClear(true)}>Clear personal details</button>{confirmDelete ? <div className="account-danger-actions"><button type="button" className="delete-account-button" onClick={() => void deleteAccount()}>Permanently delete my account</button><button type="button" className="cancel-delete-button" onClick={() => setConfirmDelete(false)}>Cancel</button></div> : <button type="button" className="delete-account-button" onClick={() => setConfirmDelete(true)}>Delete account</button>}</div>}</section>{widgetHelpOpen && <div className="overlay widget-help-overlay" role="dialog" aria-modal="true" aria-labelledby="widget-help-title" onClick={() => setWidgetHelpOpen(false)}><section className="widget-help-dialog" onClick={(event) => event.stopPropagation()}><button type="button" className="clear-details-close" onClick={() => setWidgetHelpOpen(false)} aria-label="Close"><Icon name="close" size="sm" /></button><span className="eyebrow">IOS HOME SCREEN</span><h2 id="widget-help-title">Add the MyanAid widget</h2><ol><li>Touch and hold an empty area of the Home Screen.</li><li>Tap <strong>Edit</strong>, then <strong>Add Widget</strong>.</li><li>Search for <strong>MyanAid</strong>, choose Small or Medium, then tap <strong>Add Widget</strong>.</li></ol><p>The Emergency widget switch permits MyanAid to refresh its safety outlook. iOS requires you to choose where the widget appears.</p><button type="button" className="ai-primary profile-save" onClick={() => setWidgetHelpOpen(false)}>Got it</button></section></div>}{confirmClear && <div className="overlay clear-details-overlay" role="dialog" aria-modal="true" aria-labelledby="clear-details-title"><section className="clear-details-dialog"><button type="button" className="clear-details-close" onClick={() => setConfirmClear(false)} aria-label="Close"><Icon name="close" size="sm" /></button><h2 id="clear-details-title">Clear personal details?</h2><p>This removes your name, photo, phone and emergency contact from this browser. Your saved alerts and preferences stay available.</p><button type="button" className="clear-details-confirm" onClick={() => { onClearDetails(); setName(""); setPhone(""); setContact(""); setAvatarPreview(""); setAvatarFile(null); setConfirmClear(false); }}>Clear personal details <Icon name="close" size="sm" /></button></section></div>}</main>;
   const profileTabs = <div className="profile-tabs"><button type="button" className={tab === "details" ? "active" : ""} onClick={() => setTab("details")}>Your details</button><button type="button" className={tab === "alerts" ? "active" : ""} onClick={() => setTab("alerts")}>Alert preferences</button><button type="button" className={tab === "privacy" ? "active" : ""} onClick={() => setTab("privacy")}>Access & privacy</button></div>;
   if (tab === "details") return <main className="inner-page content reference-screen profile-settings"><div className="page-heading"><h1>Settings</h1><p>Manage your personal safety profile and account.</p></div>{profileTabs}<section className="profile-section"><div className="profile-summary"><label className="avatar avatar-upload" title="Choose a profile photo"><input type="file" accept="image/*" onChange={event => { const file = event.target.files?.[0]; if (file) { setAvatarFile(file); setAvatarPreview(URL.createObjectURL(file)); } }} />{avatarPreview ? <Image src={avatarPreview} alt="Profile preview" width={54} height={54} unoptimized /> : initial}<b>Change photo</b></label><div><span className="eyebrow">Private profile</span><h2>{name || "Your MyanAid profile"}</h2><p>{user?.email ?? "Sign in to save your profile."}</p><small className={`sync-status ${syncStatus}`}>{statusCopy}</small></div></div><div className="profile-form"><label>Display name<input value={name} onChange={e => setName(e.target.value)} placeholder="How should MyanAid address you?" /></label><label>Phone number <small>Optional</small><input value={phone} onChange={e => setPhone(e.target.value)} placeholder="For your emergency plan" /></label><label>Emergency contact <small>Optional</small><input value={contact} onChange={e => setContact(e.target.value)} placeholder="Name and phone number" /></label></div><div className="profile-inline-actions"><button type="button" onClick={onLocations}>Manage saved locations</button><button type="button" onClick={onMascot}>My companion · {findMascot(mascotId).name}</button><button type="button" onClick={onAuth}>{user ? "Sign out" : "Sign in or create account"}</button></div><button type="button" className="ai-primary profile-save" onClick={() => void save()}>{saving ? "Saving…" : "Save personal details"}</button>{notice && <p className="profile-notice">{notice}</p>}</section></main>;
   if (tab === "alerts") return <main className="inner-page content reference-screen profile-settings"><div className="page-heading"><h1>Alert preferences</h1><p>Control only the safety permissions you want.</p></div>{profileTabs}<section className="profile-section">{([ ["notifications", "Notifications", "Receive relevant emergency updates."], ["audio", "Audio alerts", "Play a sound for high-priority alerts."], ["companion", "Mascot outside the app", "Show your companion in supported device surfaces."], ["widget", "Emergency widget", "Allow future home-screen safety widgets."], ["camera", "Camera access", "Used only when you start a camera feature."], ["files", "File access", "Used only when you choose an attachment."] ] as Array<[keyof typeof prefs, string, string]>).map(([key, title, copy]) => <button type="button" className="preference-row" key={key} onClick={() => key === "camera" ? void toggleCamera() : toggle(key)}><span><strong>{title}</strong><small>{copy}</small></span><i className={prefs[key] ? "switch on" : "switch"} /></button>)}<button type="button" className="ai-primary profile-save" onClick={() => void save()}>Save alert preferences</button>{notice && <p className="profile-notice">{notice}</p>}</section></main>;
@@ -1798,7 +2001,7 @@ function LocalEmergencyContacts({ coordinates, locationLabel, compact = false }:
   return <section className={`local-emergency-contacts ${compact ? "compact" : ""}`} aria-label="Local emergency contacts"><header><div className="contact-title-icon"><Icon name="firstAid" size="sm" /></div><div><div className="eyebrow">Local contacts</div><h3>Call for help</h3></div></header>{inThailand ? <><p className="contact-location"><Icon name="location" size="sm" />Available for your Thailand location{locationLabel.startsWith("Current") ? "" : ` · ${locationLabel}`}</p><div className="emergency-contact-list">{visibleContacts.map((contact) => <a href={`tel:${contact.number}`} key={contact.number} className="emergency-contact"><Icon name={contact.icon} size="sm" /><span><small>{contact.label}</small><strong>{contact.number}</strong><em>{contact.note}</em></span><b>Call</b></a>)}</div>{!compact && <a className="nearby-hospital-link" href={nearbyHospitalUrl} target="_blank" rel="noreferrer"><Icon name="location" size="sm" />Find the nearest hospital <Icon name="arrow" size="sm" /></a>}<small className="contact-source">Source: Thailand Government <Icon name="arrow" size="sm" /></small></> : <p className="contact-location">Checking your permitted location for verified local emergency contacts…</p>}</section>;
 }
 
-function AIPanel({ onClose, mascotId, user, sourceMonitoring, language, emergencyActive, currentCoordinates, locationLabel }: { onClose: () => void; mascotId: MascotId; user: User | null; sourceMonitoring: SourceMonitoringState; language: string; emergencyActive: boolean; currentCoordinates: SourceCoordinates | null; locationLabel: string }) {
+function AIPanel({ onClose, mascotId, user, sourceMonitoring, language, locale, emergencyActive, currentCoordinates, locationLabel }: { onClose: () => void; mascotId: MascotId; user: AppUser | null; sourceMonitoring: SourceMonitoringState; language: string; locale: AppLocale; emergencyActive: boolean; currentCoordinates: SourceCoordinates | null; locationLabel: string }) {
   const mascot = findMascot(mascotId);
   const [brief, setBrief] = useState<ActionBrief | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1809,7 +2012,10 @@ function AIPanel({ onClose, mascotId, user, sourceMonitoring, language, emergenc
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [sosOpen, setSosOpen] = useState(false);
   const chatThreadRef = useRef<HTMLDivElement>(null);
-  const languageCode = language === "ไทย" ? "th-TH" : language === "မြန်မာ" ? "my-MM" : language === "Bahasa Indonesia" ? "id-ID" : "en-GB";
+  const speechAudioRef = useRef<HTMLAudioElement | null>(null);
+  const speechPlaybackIdRef = useRef(0);
+  const voiceLocale: Record<AppLocale, string> = { en: "en-GB", my: "my-MM", fr: "fr-FR", de: "de-DE", hi: "hi-IN", id: "id-ID", ja: "ja-JP", km: "km-KH", ko: "ko-KR", lo: "lo-LA", ms: "ms-MY", es: "es-ES", tl: "fil-PH", th: "th-TH" };
+  const languageCode = voiceLocale[locale];
   const greeting = language === "ไทย" ? `สวัสดี ฉันคือ ${mascot.name} ฉันจะช่วยสรุปข้อมูลความปลอดภัยจากแหล่งที่เชื่อถือได้` : language === "မြန်မာ" ? `မင်္ဂလာပါ၊ ကျွန်တော် ${mascot.name} ပါ။ ယုံကြည်ရသော ဘေးကင်းရေးအချက်အလက်များကို ရှင်းပြပေးနိုင်ပါတယ်။` : language === "Bahasa Indonesia" ? `Halo, saya ${mascot.name}. Saya dapat menjelaskan informasi keselamatan dari sumber tepercaya.` : `Hi, I’m ${mascot.name}. I can explain current safety information from verified sources.`;
   const [chat, setChat] = useState<CompanionChatTurn[]>([{ role: "assistant", text: greeting }]);
   const [chatHistoryReady, setChatHistoryReady] = useState(false);
@@ -1851,12 +2057,62 @@ function AIPanel({ onClose, mascotId, user, sourceMonitoring, language, emergenc
     return () => window.removeEventListener("mynaid-companion-prompt", receivePreparednessQuestion);
   }, []);
   const currentSummary = `Current sources: ${sourceMonitoring.airQuality ? `AQI ${sourceMonitoring.airQuality.usAqi} modelled air quality` : "air-quality update pending"}; ${sourceMonitoring.river ? `${sourceMonitoring.river.discharge} m³/s river model` : "river update pending"}; ${sourceMonitoring.feeds.length} connected provider feeds.`;
-  const speak = (text: string) => {
-    if (!("speechSynthesis" in window)) return;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = languageCode;
-    window.speechSynthesis.speak(utterance);
+  useEffect(() => () => { speechPlaybackIdRef.current += 1; speechAudioRef.current?.pause(); }, []);
+  const speak = async (text: string) => {
+    if (!user) { setMessage("Sign in from Profile to listen to AI replies."); return; }
+    if (!functions) { setMessage("Spoken replies are unavailable until Firebase is configured."); return; }
+    const splitIntoSpeechSegments = (value: string) => {
+      const segments: string[] = [];
+      let remaining = value.trim();
+      const maxLength = 520;
+      while (remaining) {
+        if (remaining.length <= maxLength) { segments.push(remaining); break; }
+        const punctuation = ["\n", "။", ".", "!", "?", ";", " "];
+        const boundary = Math.max(...punctuation.map((mark) => remaining.lastIndexOf(mark, maxLength)));
+        const cut = boundary >= Math.floor(maxLength * 0.45) ? boundary + 1 : maxLength;
+        segments.push(remaining.slice(0, cut).trim());
+        remaining = remaining.slice(cut).trim();
+      }
+      return segments.filter(Boolean);
+    };
+    const segments = splitIntoSpeechSegments(text);
+    const playbackId = speechPlaybackIdRef.current + 1;
+    speechPlaybackIdRef.current = playbackId;
+    speechAudioRef.current?.pause();
+    setMessage(`Preparing spoken reply 1 of ${segments.length}…`);
+    try {
+      const createSpeech = httpsCallable<{ text: string; locale: AppLocale }, { audioBase64: string; mimeType: string }>(functions, "synthesizeCompanionSpeech");
+      for (const [index, segment] of segments.entries()) {
+        if (speechPlaybackIdRef.current !== playbackId) return;
+        setMessage(`Preparing spoken reply ${index + 1} of ${segments.length}…`);
+        let timeoutId: number | undefined;
+        const result = await Promise.race([
+          createSpeech({ text: segment, locale }),
+          new Promise<never>((_, reject) => {
+            timeoutId = window.setTimeout(() => reject(new Error("Speech request timed out")), 30000);
+          }),
+        ]);
+        if (timeoutId) window.clearTimeout(timeoutId);
+        if (speechPlaybackIdRef.current !== playbackId) return;
+        const binary = window.atob(result.data.audioBase64);
+        const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+        const url = URL.createObjectURL(new Blob([bytes], { type: result.data.mimeType || "audio/wav" }));
+        await new Promise<void>((resolve, reject) => {
+          const audio = new Audio(url);
+          speechAudioRef.current = audio;
+          const finish = () => { URL.revokeObjectURL(url); resolve(); };
+          audio.onended = finish;
+          audio.onpause = () => { if (speechPlaybackIdRef.current !== playbackId) finish(); };
+          audio.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Audio playback failed")); };
+          void audio.play().catch(reject);
+        });
+      }
+      setVoiceEnabled(true);
+      setMessage("");
+    } catch (error) {
+      console.error("Companion speech playback failed", error);
+      if (speechPlaybackIdRef.current === playbackId) setMessage("Spoken audio took too long to prepare. Please try Listen again.");
+    }
   };
   const sendMessage = async (text = draft, replyAloud = voiceEnabled) => {
     const clean = text.trim();
@@ -1879,7 +2135,7 @@ function AIPanel({ onClose, mascotId, user, sourceMonitoring, language, emergenc
     } finally { setLoading(false); }
   };
   const startVoiceInput = () => {
-    type Recognition = { lang: string; interimResults: boolean; onresult: (event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void; onerror: (event?: { error?: string }) => void; onend: () => void; start: () => void; };
+    type Recognition = { lang: string; interimResults: boolean; continuous?: boolean; maxAlternatives?: number; onresult: (event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void; onerror: (event?: { error?: string }) => void; onend: () => void; start: () => void; };
     type RecognitionConstructor = new () => Recognition;
     const BrowserWindow = window as unknown as { SpeechRecognition?: RecognitionConstructor; webkitSpeechRecognition?: RecognitionConstructor };
     const RecognitionApi = BrowserWindow.SpeechRecognition ?? BrowserWindow.webkitSpeechRecognition;
@@ -1887,13 +2143,21 @@ function AIPanel({ onClose, mascotId, user, sourceMonitoring, language, emergenc
     const recognition = new RecognitionApi();
     recognition.lang = languageCode;
     recognition.interimResults = false;
+    recognition.continuous = false;
+    recognition.maxAlternatives = 3;
     recognition.onresult = (event) => {
-      const transcript = event.results[0]?.[0]?.transcript?.trim() ?? "";
+      const candidates = Array.from(event.results[0] ?? []).map((result) => result.transcript.trim()).filter(Boolean);
+      const expectedScript = locale === "my" ? /[\u1000-\u109F]/ : locale === "km" ? /[\u1780-\u17FF]/ : locale === "th" ? /[\u0E00-\u0E7F]/ : locale === "lo" ? /[\u0E80-\u0EFF]/ : locale === "ja" ? /[\u3040-\u30FF\u4E00-\u9FFF]/ : locale === "ko" ? /[\uAC00-\uD7AF]/ : locale === "hi" ? /[\u0900-\u097F]/ : null;
+      const transcript = (expectedScript ? candidates.find((candidate) => expectedScript.test(candidate)) : candidates[0]) ?? candidates[0] ?? "";
       if (!transcript) return;
       setDraft(transcript);
-      // Voice is a complete hands-free turn: submit the recognised speech and
-      // read the Gemini answer aloud, rather than only filling the text box.
-      void sendMessage(transcript, true);
+      // Recognition quality varies by browser and language. Never send a
+      // possibly mistranscribed safety question without the person's review.
+      if (expectedScript && !expectedScript.test(transcript)) {
+        setMessage("The browser did not recognise the selected language reliably. Please correct the captured text before sending.");
+      } else {
+        setMessage("Review the captured text, then tap Send. It has not been sent yet.");
+      }
     };
     recognition.onerror = (event) => setMessage(event?.error === "not-allowed" ? "Microphone access is blocked. Allow microphone permission, then try again." : "Voice input could not be started. Check microphone permission and try again.");
     recognition.onend = () => setListening(false);
@@ -1917,7 +2181,7 @@ function AIPanel({ onClose, mascotId, user, sourceMonitoring, language, emergenc
   };
   const composer = <div className="chat-composer"><input value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void sendMessage(); }} placeholder={language === "ไทย" ? `พิมพ์ข้อความถึง ${mascot.name}` : language === "မြန်မာ" ? "မေးခွန်းကို ရိုက်ထည့်ပါ" : language === "Bahasa Indonesia" ? `Ketik pesan untuk ${mascot.name}` : `Message ${mascot.name}…`} /><button type="button" className={listening ? "voice-button listening" : "voice-button"} onClick={startVoiceInput} aria-label="Use voice input"><Icon name="sound" size="sm" /></button><button type="button" className="send-button" onClick={() => void sendMessage()} aria-label="Send message"><Icon name="arrow" size="sm" /></button></div>;
   const suggestions = ["Emergency kit", "Rain preparedness", "Family plan"];
-  const conversation = <><div className="chat-thread" ref={chatThreadRef} aria-live="polite">{chat.map((item, index) => <div className={`chat-bubble ${item.role}`} key={`${item.role}-${index}`}>{item.role === "assistant" && <MascotIcon mascotId={mascotId} className="chat-mascot" />}<div><p>{item.text}</p>{item.role === "assistant" && <small>Offline guide · not live AI</small>}</div></div>)}{loading && <div className="chat-typing"><span /><span /><span />{voiceEnabled ? "Preparing a spoken answer…" : "Checking verified sources…"}</div>}</div><div className="chat-suggestions">{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => void sendMessage(`Help me with ${suggestion.toLowerCase()}.`)}>{suggestion}</button>)}</div>{composer}</>;
+  const conversation = <><div className="chat-thread" ref={chatThreadRef} aria-live="polite">{chat.map((item, index) => <div className={`chat-bubble ${item.role}`} key={`${item.role}-${index}`}>{item.role === "assistant" && <MascotIcon mascotId={mascotId} className="chat-mascot" />}<div><p>{item.text}</p>{item.role === "assistant" && <><button type="button" className="chat-speak" onClick={() => void speak(item.text)} aria-label="Listen to this AI reply"><Icon name="sound" size="sm" /> Listen full reply</button><small>Offline guide · not live AI</small></>}</div></div>)}{loading && <div className="chat-typing"><span /><span /><span />{voiceEnabled ? "Preparing a spoken answer…" : "Checking verified sources…"}</div>}</div>{message && <p className="chat-voice-message" role="status">{message}</p>}<div className="chat-suggestions">{suggestions.map((suggestion) => <button type="button" key={suggestion} onClick={() => void sendMessage(`Help me with ${suggestion.toLowerCase()}.`)}>{suggestion}</button>)}</div>{composer}</>;
   return <div className="overlay companion-overlay" onClick={onClose}><div className="ai-panel chat-panel full-chat-panel" onClick={e => e.stopPropagation()}>
     <header className="companion-chat-header reference-chat-header"><button type="button" className="chat-back-button" onClick={onClose} aria-label="Close chat"><Icon name="arrow" size="sm" /></button><div className="ai-companion-head"><MascotIcon mascotId={mascotId} /><div><h1>{mascot.name} · MyanAid</h1><span>{voiceEnabled ? "Voice replies are on" : "Your safety companion"}</span></div></div><div className="companion-toolbar"><button type="button" className="brief-header-action" onClick={() => setBriefOpen(true)}><Icon name="plan" size="sm" /><span>Action Brief</span></button>{emergencyActive && <button type="button" className="sos-button" onClick={() => setSosOpen(true)} aria-label="Emergency contacts"><Icon name="alert" size="sm" /><span>SOS</span></button>}<button type="button" className="toolbar-icon-button" onClick={() => setDraft("")} aria-label="Clear draft"><Icon name="refresh" size="sm" /></button></div></header>
     <div className="companion-chat-body">{conversation}</div>
@@ -1944,19 +2208,72 @@ function ActionPage({ title, onClose }: { title: string; onClose: () => void }) 
   </div></div>;
 }
 
-function BottomNav({ current, setCurrent, alertCount }: { current: string; setCurrent: (page: string) => void; alertCount: number }) {
-  const items = [{ name: "Home", icon: "home" }, { name: "Map", icon: "map" }, { name: "Alerts", icon: "bell" }, { name: "Preparedness", icon: "battery" }, { name: "Profile", icon: "profile" }] as { name: string; icon: IconName }[];
-  const unreadAlerts = alertCount;
-  return <nav className="bottom-nav">{items.map(item => <Action key={item.name} className={`nav-item ${current === item.name ? "active" : ""}`} onClick={() => setCurrent(item.name)}><span className="nav-icon-wrap"><Icon name={item.icon} />{item.name === "Alerts" && <><b className="nav-alert-badge" aria-label={`${unreadAlerts} new alerts`}>{unreadAlerts}</b><i className="nav-alert-dot" aria-hidden="true" /></>}</span><span>{item.name}</span></Action>)}</nav>;
+function AppPackageDownloadButton({ platform, onDownload, className = "" }: { platform: DownloadableAppPlatform; onDownload: (platform: DownloadableAppPlatform) => void; className?: string }) {
+  const available = hasAppPackage(platform);
+  const label = platform === "ios" ? "Download iOS app" : "Download Android app";
+  const unavailable = platform === "ios" ? "iOS package coming soon" : "Android package coming soon";
+  return <button type="button" className={`app-download-button ${className}`.trim()} disabled={!available} onClick={() => onDownload(platform)}>
+    <Icon name="battery" size="sm" />
+    <span><PublicTranslation text={available ? label : unavailable} /></span>
+    {available && <Icon name="arrow" size="sm" />}
+  </button>;
 }
 
-function AuthDialog({ onClose }: { onClose: () => void }) {
+function AppInstallPrompt({ platform, onSkip, onOpenProfile, onDownload }: { platform: DownloadableAppPlatform; onSkip: () => void; onOpenProfile: () => void; onDownload: (platform: DownloadableAppPlatform) => void }) {
+  const deviceName = platform === "ios" ? "iPhone or iPad" : "Android device";
+  const available = hasAppPackage(platform);
+  const title = platform === "ios" ? "Get MyanAid for iPhone" : "Get MyanAid for Android";
+
+  return <div className="install-prompt-overlay" role="presentation" onClick={onSkip}>
+    <section className="install-prompt-dialog" role="dialog" aria-modal="true" aria-labelledby="install-prompt-title" onClick={(event) => event.stopPropagation()}>
+      <button type="button" className="install-prompt-close" onClick={onSkip} aria-label="Skip app download"><Icon name="close" size="sm" /></button>
+      <div className="install-prompt-mark"><MascotIcon mascotId="maya" /></div>
+      <span className="eyebrow"><PublicTranslation text="MYANAID APP" /></span>
+      <h2 id="install-prompt-title"><PublicTranslation text={title} /></h2>
+      <p><PublicTranslation text={`You are browsing on an ${deviceName}. You can download the app now, or choose Skip and download it later from Profile.`} /></p>
+      {!available && <p className="install-prompt-unavailable"><PublicTranslation text={`The ${platform === "ios" ? "iOS" : "Android"} package has not been published yet. You can check Profile later.`} /></p>}
+      <div className="install-prompt-actions">
+        <AppPackageDownloadButton platform={platform} onDownload={(target) => { onDownload(target); onSkip(); }} className="primary" />
+        <button type="button" className="install-prompt-profile" onClick={onOpenProfile}><PublicTranslation text="Open Profile" /><Icon name="profile" size="sm" /></button>
+      </div>
+      <button type="button" className="install-prompt-skip" onClick={onSkip}><PublicTranslation text="Skip for now" /></button>
+    </section>
+  </div>;
+}
+
+function ProfileDownloadCard({ platform, onDownload }: { platform: AppDownloadPlatform; onDownload: (platform: DownloadableAppPlatform) => void }) {
+  const packages: DownloadableAppPlatform[] = platform === "other" ? ["android", "ios"] : [platform];
+  const deviceName = platform === "ios" ? "your iPhone or iPad" : platform === "android" ? "your Android device" : "a mobile device";
+
+  return <section className="profile-download-card" aria-labelledby="profile-download-title">
+    <div className="profile-download-heading">
+      <span><Icon name="battery" /></span>
+      <div><small><PublicTranslation text="MYANAID MOBILE" /></small><h2 id="profile-download-title"><PublicTranslation text="Download MyanAid" /></h2><p><PublicTranslation text={`Install the app for ${deviceName} to use native alerts, widgets, and your safety companion.`} /></p></div>
+    </div>
+    <div className="profile-download-actions">{packages.map((target) => <AppPackageDownloadButton key={target} platform={target} onDownload={onDownload} />)}</div>
+    <small className="profile-download-note"><PublicTranslation text="The available option opens the secure distribution link configured for your device." /></small>
+  </section>;
+}
+
+function BottomNav({ current, setCurrent, alertCount }: { current: string; setCurrent: (page: string) => void; alertCount: number }) {
+  const { t } = useAppI18n();
+  const items = [{ name: "Home", key: "home", icon: "home" }, { name: "Map", key: "map", icon: "map" }, { name: "Alerts", key: "alerts", icon: "bell" }, { name: "Preparedness", key: "preparedness", icon: "battery" }, { name: "Profile", key: "profile", icon: "profile" }] as { name: string; key: string; icon: IconName }[];
+  const unreadAlerts = alertCount;
+  return <nav className="bottom-nav">{items.map(item => <Action key={item.name} className={`nav-item ${current === item.name ? "active" : ""}`} onClick={() => setCurrent(item.name)}><span className="nav-icon-wrap"><Icon name={item.icon} />{item.name === "Alerts" && <><b className="nav-alert-badge" aria-label={`${unreadAlerts} new alerts`}>{unreadAlerts}</b><i className="nav-alert-dot" aria-hidden="true" /></>}</span><span>{t(item.key)}</span></Action>)}</nav>;
+}
+
+function AuthDialog({ onClose, onNativeUser }: { onClose: () => void; onNativeUser: (user: AppUser) => void }) {
   const [mode, setMode] = useState<"sign-in" | "create">("sign-in");
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+
+  const completeWithin = <T,>(operation: Promise<T>) => Promise.race<T>([
+    operation,
+    new Promise<T>((_, reject) => window.setTimeout(() => reject({ code: "auth/operation-timeout" }), 20_000)),
+  ]);
 
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -1975,8 +2292,33 @@ function AuthDialog({ onClose }: { onClose: () => void }) {
     setBusy(true);
     setMessage("");
     try {
+      if (usesNativeFirebase) {
+        const result = mode === "create"
+          ? await FirebaseAuthentication.createUserWithEmailAndPassword({ email: email.trim(), password })
+          : await FirebaseAuthentication.signInWithEmailAndPassword({ email: email.trim(), password });
+        if (!result.user) throw { code: "auth/no-current-user" };
+        const nativeUser: AppUser = { uid: result.user.uid, email: result.user.email };
+        if (mode === "create") {
+          await FirebaseFirestore.setDocument({
+            reference: nativeProfileReference(nativeUser.uid),
+            merge: true,
+            data: {
+              email: nativeUser.email,
+              displayName: displayName.trim(),
+              preferredLanguage: "English",
+              savedLocations: starterLocations,
+              mascotId: "maya",
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+          });
+        }
+        onNativeUser(nativeUser);
+        onClose();
+        return;
+      }
       if (mode === "create") {
-        const credential = await createUserWithEmailAndPassword(auth, email.trim(), password);
+        const credential = await completeWithin(createUserWithEmailAndPassword(auth, email.trim(), password));
         void setDoc(doc(db, "users", credential.user.uid), {
           email: credential.user.email,
           displayName: displayName.trim(),
@@ -1989,18 +2331,28 @@ function AuthDialog({ onClose }: { onClose: () => void }) {
           // Authentication has succeeded; Firestore will be retried when the user updates their profile.
         });
       } else {
-        await signInWithEmailAndPassword(auth, email.trim(), password);
+        await completeWithin(signInWithEmailAndPassword(auth, email.trim(), password));
       }
       onClose();
     } catch (error) {
       const code = (error as { code?: string }).code;
+      // Keep the user-facing response concise, while preserving the exact
+      // Firebase code in the Xcode/device console for release diagnostics.
+      // This contains no credentials or personal profile information.
+      console.error("MyanAid Firebase email/password authentication failed", code ?? "unknown", error);
       const errors: Record<string, string> = {
         "auth/email-already-in-use": "That email already has a MyanAid account. Try signing in instead.",
         "auth/invalid-credential": "Email or password is incorrect.",
         "auth/invalid-email": "Enter a valid email address.",
+        "auth/network-request-failed": "We could not reach Firebase. Check your connection and try again.",
+        "auth/operation-not-allowed": "Email and password sign-in is not enabled for this Firebase project.",
+        "auth/operation-timeout": "Firebase did not respond within 20 seconds. Please try again on a stable connection.",
+        "auth/unauthorized-domain": "This app origin is not authorised by Firebase yet.",
+        "auth/api-key-not-valid": "The app's Firebase configuration needs attention.",
+        "auth/no-current-user": "Firebase did not return a signed-in account. Please try again.",
         "permission-denied": "Your account was created, but Firestore needs its user security rule enabled.",
       };
-      setMessage(errors[code ?? ""] ?? "We could not complete that request. Please try again.");
+      setMessage(errors[code ?? ""] ?? `Firebase could not complete the request (${code ?? "unknown error"}).`);
     } finally {
       setBusy(false);
     }
@@ -2025,9 +2377,39 @@ function AuthDialog({ onClose }: { onClose: () => void }) {
 }
 
 export default function App() {
+  return <AppLocaleProvider><AppContent /></AppLocaleProvider>;
+}
+
+function AppContent() {
+  const { locale, setLocale, language: activeLanguage } = useAppI18n();
   const [page, setPage] = useState("Home");
   const [preparednessTab, setPreparednessTab] = useState<"kit" | "family" | "shelters" | "aid">("kit");
-  const [language, setLanguage] = useState("English");
+  const language = activeLanguage.label;
+  const [downloadPlatform, setDownloadPlatform] = useState<AppDownloadPlatform>("other");
+  const [installPromptOpen, setInstallPromptOpen] = useState(false);
+  useEffect(() => {
+    if (usesNativeFirebase) return;
+    const platform = detectAppDownloadPlatform();
+    setDownloadPlatform(platform);
+    if (platform === "other") return;
+    try {
+      if (window.sessionStorage.getItem("myanaid-install-prompt-skipped-v1")) return;
+    } catch {
+      // Showing the prompt remains safe if the browser does not expose storage.
+    }
+    const timer = window.setTimeout(() => setInstallPromptOpen(true), 250);
+    return () => window.clearTimeout(timer);
+  }, []);
+  const skipInstallPrompt = () => {
+    try { window.sessionStorage.setItem("myanaid-install-prompt-skipped-v1", "true"); } catch { /* session-only dismissal */ }
+    setInstallPromptOpen(false);
+  };
+  const openProfileForDownload = () => {
+    skipInstallPrompt();
+    setPage("Profile");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+  const startPackageDownload = (platform: DownloadableAppPlatform) => { void downloadAppPackage(platform); };
   useEffect(() => {
     try {
       if (new URLSearchParams(window.location.search).get("familyInvite")) {
@@ -2036,20 +2418,11 @@ export default function App() {
       }
     } catch { /* The regular home route remains available if the URL cannot be read. */ }
   }, []);
-  useEffect(() => {
-    try {
-      const savedLanguage = window.localStorage.getItem("myanaid-language");
-      if (savedLanguage && ["English", "မြန်မာ", "ไทย", "Bahasa Indonesia"].includes(savedLanguage)) setLanguage(savedLanguage);
-    } catch { /* Language selection remains available without browser storage. */ }
-  }, []);
-  useEffect(() => {
-    try { window.localStorage.setItem("myanaid-language", language); } catch { /* Keep the in-memory choice when storage is unavailable. */ }
-  }, [language]);
   const monitoring = useLiveMonitoring();
   const sourceMonitoring = useSourceMonitoring();
   const currentLocation = useCurrentLocation();
   const companionCondition = localCondition(monitoring.weather);
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<AppUser | null>(null);
   const [savedLocations, setSavedLocations] = useState<SavedLocation[]>(starterLocations);
   const [mascotId, setMascotId] = useState<MascotId>("maya");
   const [syncStatus, setSyncStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
@@ -2069,20 +2442,53 @@ export default function App() {
   const [selectedAlert, setSelectedAlert] = useState<AlertData | null>(null);
   const [savedAlertIds, setSavedAlertIds] = useState<string[]>([]);
   const [localGuideOpen, setLocalGuideOpen] = useState(false);
+  const [outlookOpen, setOutlookOpen] = useState(false);
   const [selectedSourceEvent, setSelectedSourceEvent] = useState<{ event: SourceFeedItem; feed: SourceFeed } | null>(null);
   const goMap = () => setPage("Map");
+  useEffect(() => listenForDeviceUrl((url) => {
+    try {
+      if (new URL(url).host !== "outlook") return;
+      setPage("Home");
+      setOutlookOpen(true);
+    } catch {
+      // Ignore malformed external URLs; they must never affect navigation.
+    }
+  }), []);
+  useEffect(() => {
+    // Always write a readable first payload. The server-generated AI outlook
+    // replaces this local fallback once it arrives from Firestore.
+    const outlook = sourceMonitoring.outlook ?? fallbackWidgetOutlook(monitoring.weather);
+    // A native wrapper can subscribe to this stable browser event and present
+    // the same source-backed reminder only after the person has opted in.
+    const reminder = advanceOutlookReminder(outlook, monitoring.weather, mascotId);
+    window.dispatchEvent(new CustomEvent<AdvanceOutlookReminder>("myanaid-advance-outlook", { detail: reminder }));
+    void saveDeviceOutlook(reminder).catch((error) => console.error("MyanAid device outlook sync failed", error));
+  }, [sourceMonitoring.outlook, monitoring.weather, mascotId]);
   useEffect(() => { try { const stored = window.localStorage.getItem("myanaid-saved-alerts"); if (stored) setSavedAlertIds(JSON.parse(stored)); } catch { /* ignore unavailable local storage */ } }, []);
   const toggleSavedAlert = (alert: AlertData) => setSavedAlertIds((current) => { const next = current.includes(alert.id) ? current.filter((id) => id !== alert.id) : [...current, alert.id]; try { window.localStorage.setItem("myanaid-saved-alerts", JSON.stringify(next)); } catch { /* keep the in-memory selection */ } return next; });
-  const clearPersonalDetails = () => { try { window.localStorage.removeItem("myanaid-profile-photo"); } catch { /* nothing to clear */ } if (user && db) void setDoc(doc(db, "users", user.uid), { displayName: "", phone: "", emergencyContact: "", photoURL: null, updatedAt: serverTimestamp() }, { merge: true }); };
+  const clearPersonalDetails = () => { try { window.localStorage.removeItem("myanaid-profile-photo"); } catch { /* nothing to clear */ } if (user) {
+    const data = { displayName: "", phone: "", emergencyContact: "", photoURL: null, updatedAt: profileTimestamp() };
+    if (usesNativeFirebase) void FirebaseFirestore.setDocument({ reference: nativeProfileReference(user.uid), data, merge: true });
+    else if (db) void setDoc(doc(db, "users", user.uid), data, { merge: true });
+  } };
   const handleAccount = async () => {
-    if (user && auth) {
-      await signOut(auth);
+    if (user) {
+      if (usesNativeFirebase) await FirebaseAuthentication.signOut();
+      else if (auth) await signOut(auth);
+      setUser(null);
       setPage("Home");
       return;
     }
     setAuthOpen(true);
   };
   useEffect(() => {
+    if (usesNativeFirebase) {
+      let active = true;
+      void FirebaseAuthentication.getCurrentUser().then(({ user: nativeUser }) => {
+        if (active) setUser(nativeUser ? { uid: nativeUser.uid, email: nativeUser.email } : null);
+      }).catch((error) => console.error("MyanAid native Firebase session check failed:", error));
+      return () => { active = false; };
+    }
     if (!auth) return;
     return onAuthStateChanged(auth, async (nextUser) => {
       setUser(nextUser);
@@ -2092,7 +2498,6 @@ export default function App() {
       // waiting for the real-time listener before the first Firestore write.
       setSyncStatus("saving");
       try {
-        await nextUser.getIdToken(true);
         const userDocument = doc(db, "users", nextUser.uid);
         const existingProfile = await getDoc(userDocument);
         await setDoc(userDocument, existingProfile.exists() ? {
@@ -2114,7 +2519,38 @@ export default function App() {
     });
   }, []);
   useEffect(() => {
-    if (!user || !db) {
+    if (!user) {
+      setSavedLocations(starterLocations);
+      setSyncStatus("idle");
+      return;
+    }
+    if (usesNativeFirebase) {
+      let callbackId: string | undefined;
+      let cancelled = false;
+      void FirebaseFirestore.addDocumentSnapshotListener({ reference: nativeProfileReference(user.uid) }, (event, error) => {
+        if (error) {
+          console.error("MyanAid native profile listener failed:", error);
+          setSyncStatus("error");
+          return;
+        }
+        const profile = event?.snapshot.data as Record<string, unknown> | null;
+        if (!profile) {
+          setSyncStatus("saving");
+          void FirebaseFirestore.setDocument({ reference: nativeProfileReference(user.uid), merge: true, data: { email: user.email, preferredLanguage: "English", savedLocations: starterLocations, mascotId: "maya", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() } }).catch(() => setSyncStatus("error"));
+          return;
+        }
+        const locations = profile.savedLocations;
+        if (Array.isArray(locations)) setSavedLocations(locations as SavedLocation[]);
+        const savedMascot = profile.mascotId;
+        setMascotId(mascots.some((mascot) => mascot.id === savedMascot) ? savedMascot as MascotId : "maya");
+        setSyncStatus(event?.snapshot.metadata.hasPendingWrites ? "saving" : "saved");
+      }).then((id) => {
+        if (cancelled) void FirebaseFirestore.removeSnapshotListener({ callbackId: id });
+        else callbackId = id;
+      }).catch((error) => { console.error("MyanAid native profile listener setup failed:", error); setSyncStatus("error"); });
+      return () => { cancelled = true; if (callbackId) void FirebaseFirestore.removeSnapshotListener({ callbackId }); };
+    }
+    if (!db) {
       setSavedLocations(starterLocations);
       setSyncStatus("idle");
       return;
@@ -2123,13 +2559,13 @@ export default function App() {
     return onSnapshot(userDocument, (snapshot) => {
       if (!snapshot.exists()) {
         setSyncStatus("saving");
-        void user.getIdToken().then(() => setDoc(userDocument, {
+        void setDoc(userDocument, {
           email: user.email,
           preferredLanguage: "English",
           savedLocations: starterLocations,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
-        })).catch((error) => {
+        }).catch((error) => {
           console.error("MyanAid Firestore profile write failed:", error);
           setSyncStatus("error");
         });
@@ -2147,16 +2583,18 @@ export default function App() {
     });
   }, [user]);
   const saveLocations = async (nextLocations: SavedLocation[]) => {
-    if (!user || !db) {
+    if (!user || (!usesNativeFirebase && !db)) {
       throw new Error("Sign in before saving locations");
     }
     setSavedLocations(nextLocations);
     setSyncStatus("saving");
     try {
-      await setDoc(doc(db, "users", user.uid), {
+      const data = {
         savedLocations: nextLocations,
-        updatedAt: serverTimestamp(),
-      }, { merge: true });
+        updatedAt: profileTimestamp(),
+      };
+      if (usesNativeFirebase) await FirebaseFirestore.setDocument({ reference: nativeProfileReference(user.uid), data, merge: true });
+      else await setDoc(doc(db!, "users", user.uid), data, { merge: true });
       setSyncStatus("saved");
     } catch (error) {
       setSyncStatus("error");
@@ -2164,11 +2602,13 @@ export default function App() {
     }
   };
   const saveMascot = async (nextMascotId: MascotId) => {
-    if (!user || !db) throw new Error("Sign in before choosing a companion");
+    if (!user || (!usesNativeFirebase && !db)) throw new Error("Sign in before choosing a companion");
     setMascotId(nextMascotId);
     setSyncStatus("saving");
     try {
-      await setDoc(doc(db, "users", user.uid), { mascotId: nextMascotId, updatedAt: serverTimestamp() }, { merge: true });
+      const data = { mascotId: nextMascotId, updatedAt: profileTimestamp() };
+      if (usesNativeFirebase) await FirebaseFirestore.setDocument({ reference: nativeProfileReference(user.uid), data, merge: true });
+      else await setDoc(doc(db!, "users", user.uid), data, { merge: true });
       setSyncStatus("saved");
     } catch (error) {
       setSyncStatus("error");
@@ -2181,23 +2621,25 @@ export default function App() {
     return () => window.removeEventListener("mynaid-action", handleAction);
   }, []);
   return <div className="app-shell"><MascotNameSync mascotId={mascotId} />
-    {page !== "Pro" && <Header onLocation={currentLocation.requestLocation} locationLabel={currentLocation.label} locationLoading={currentLocation.loading} language={language} setLanguage={setLanguage} onProfile={() => setPage("Profile")} user={user} />}
-    {page === "Home" && <Home onMap={goMap} onCategory={setCategory} onAlert={setSelectedAlert} onPreparedness={(tab) => { setPreparednessTab(tab); setPage("Preparedness"); }} onLocalGuide={() => setLocalGuideOpen(true)} savedLocations={savedLocations} monitoring={monitoring} sourceMonitoring={sourceMonitoring} mascotId={mascotId} />}
+    {page !== "Pro" && <Header onLocation={currentLocation.requestLocation} locationLabel={currentLocation.label} locationLoading={currentLocation.loading} locale={locale} setLocale={setLocale} onProfile={() => setPage("Profile")} user={user} />}
+    {page === "Home" && <Home onMap={goMap} onCategory={setCategory} onAlert={setSelectedAlert} onPreparedness={(tab) => { setPreparednessTab(tab); setPage("Preparedness"); }} onLocalGuide={() => setLocalGuideOpen(true)} onOutlook={() => setOutlookOpen(true)} savedLocations={savedLocations} monitoring={monitoring} sourceMonitoring={sourceMonitoring} mascotId={mascotId} />}
     {page === "Map" && <MapView onAlert={setSelectedAlert} sourceMonitoring={sourceMonitoring} />}
     {page === "Alerts" && <AlertsView onAlert={setSelectedAlert} />}
     {page === "Preparedness" && <PreparednessView locationLabel={currentLocation.label} savedLocations={savedLocations} monitoring={monitoring} sourceMonitoring={sourceMonitoring} currentCoordinates={currentLocation.coordinates} requestCurrentLocation={currentLocation.requestLocation} selectedTab={preparednessTab} user={user} onSignIn={() => setAuthOpen(true)} mascotId={mascotId} onAskCompanion={(prompt) => { setAIOpen(true); window.setTimeout(() => window.dispatchEvent(new CustomEvent("mynaid-companion-prompt", { detail: prompt })), 0); }} />}
-    {page === "Profile" && <ProfileView onPro={() => setPage("Pro")} onLocations={() => setLocationSetupOpen(true)} onMascot={() => setMascotPickerOpen(true)} mascotId={mascotId} user={user} onAuth={handleAccount} syncStatus={syncStatus} savedAlerts={[localAlert, ...alerts].filter((alert) => savedAlertIds.includes(alert.id))} onClearDetails={clearPersonalDetails} />}
+    {page === "Profile" && <><ProfileView onPro={() => setPage("Pro")} onLocations={() => setLocationSetupOpen(true)} onMascot={() => setMascotPickerOpen(true)} mascotId={mascotId} user={user} onAuth={handleAccount} syncStatus={syncStatus} savedAlerts={[localAlert, ...alerts].filter((alert) => savedAlertIds.includes(alert.id))} onClearDetails={clearPersonalDetails} />{!usesNativeFirebase && <ProfileDownloadCard platform={downloadPlatform} onDownload={startPackageDownload} />}</>}
     {page === "Pro" && <ProDashboard onBack={() => setPage("Profile")} />}
     {page !== "Pro" && !selectedAlert && !localGuideOpen && <FloatingAI onClick={() => setAIOpen(true)} mascotId={mascotId} message={companionCondition.companionMessage} severity={companionCondition.severity} emergencyActive={sosPreviewActive || companionCondition.severity === "critical"} />}
     {page !== "Pro" && <BottomNav current={page} setCurrent={setPage} alertCount={[localAlert, ...alerts].length} />}
     {category && <CategoryDrawer title={category} onClose={() => setCategory(null)} onAI={() => setAIOpen(true)} onSourceEvent={(event, feed) => { setCategory(null); setSelectedSourceEvent({ event, feed }); }} monitoring={monitoring} sourceMonitoring={sourceMonitoring} />}
     {selectedAlert && <AlertDrawer alert={selectedAlert} onClose={() => setSelectedAlert(null)} saved={savedAlertIds.includes(selectedAlert.id)} onToggleSaved={toggleSavedAlert} />}
+    {outlookOpen && sourceMonitoring.outlook && <AdvanceOutlookDialog outlook={sourceMonitoring.outlook} onClose={() => setOutlookOpen(false)} />}
     {localGuideOpen && <LocalGuideDrawer monitoring={monitoring} onClose={() => setLocalGuideOpen(false)} onPreparedness={() => { setLocalGuideOpen(false); setPage("Preparedness"); }} onAskCompanion={() => { setLocalGuideOpen(false); setAIOpen(true); window.setTimeout(() => window.dispatchEvent(new CustomEvent("mynaid-companion-prompt", { detail: "Help me prepare for the current weather conditions in Bangkok." })), 0); }} />}
     {selectedSourceEvent && <SourceEventDrawer event={selectedSourceEvent.event} feed={selectedSourceEvent.feed} onClose={() => setSelectedSourceEvent(null)} />}
-    {aiOpen && <AIPanel onClose={() => setAIOpen(false)} mascotId={mascotId} user={user} sourceMonitoring={sourceMonitoring} language={language} emergencyActive={sosPreviewActive || companionCondition.severity === "critical"} currentCoordinates={currentLocation.coordinates} locationLabel={currentLocation.label} />}
+    {aiOpen && <AIPanel onClose={() => setAIOpen(false)} mascotId={mascotId} user={user} sourceMonitoring={sourceMonitoring} language={language} locale={locale} emergencyActive={sosPreviewActive || companionCondition.severity === "critical"} currentCoordinates={currentLocation.coordinates} locationLabel={currentLocation.label} />}
     {locationSetupOpen && <LocationSetup onClose={() => setLocationSetupOpen(false)} locations={savedLocations} signedIn={Boolean(user)} onSave={saveLocations} />}
     {mascotPickerOpen && <MascotPicker onClose={() => setMascotPickerOpen(false)} mascotId={mascotId} signedIn={Boolean(user)} onSave={saveMascot} />}
     {actionPage && <ActionPage title={actionPage} onClose={() => setActionPage(null)} />}
-    {authOpen && <AuthDialog onClose={() => setAuthOpen(false)} />}
+    {authOpen && <AuthDialog onClose={() => setAuthOpen(false)} onNativeUser={setUser} />}
+    {installPromptOpen && downloadPlatform !== "other" && <AppInstallPrompt platform={downloadPlatform} onSkip={skipInstallPrompt} onOpenProfile={openProfileForDownload} onDownload={startPackageDownload} />}
   </div>;
 }

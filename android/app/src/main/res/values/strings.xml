@@ -1,0 +1,23 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">MyanAid</string>
+    <string name="title_activity_main">MyanAid</string>
+    <string name="package_name">com.myanaid.app</string>
+    <string name="custom_url_scheme">com.myanaid.app</string>
+    <string name="weather_attention_channel_name">Weather attention</string>
+    <string name="notification_action_listen">Listen</string>
+    <string name="notification_action_ask_maya">Ask Maya</string>
+    <string name="notification_action_mute_two_hours">Mute 2 hours</string>
+    <string name="notification_action_open_forecast">Open forecast</string>
+    <string name="weather_attention_fallback">An updated safety outlook is ready in MyanAid.</string>
+    <string name="weather_attention_recommendation_fallback">Review the latest local conditions before travelling.</string>
+    <string name="maya_chat_close">Close chat</string>
+    <string name="maya_chat_send">Send</string>
+    <string name="maya_chat_send_description">Send message</string>
+    <string name="maya_chat_safety_label">Safety chat</string>
+    <string name="maya_chat_latest_outlook">Latest safety outlook</string>
+    <string name="maya_chat_outlook_waiting">MyanAid will show your next saved safety outlook here.</string>
+    <string name="maya_chat_recommendation_fallback">Check local conditions before travelling.</string>
+    <string name="maya_chat_message_hint">Message %1$s…</string>
+    <string name="maya_chat_request_failed">I could not reach the live assistant just now. The latest safety outlook remains above; for immediate danger, follow official local authority instructions.</string>
+</resources>
